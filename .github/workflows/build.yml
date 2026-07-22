@@ -1,4 +1,4 @@
-name: .github/workflows/build.yml
+name: 
 
 # Собирается автоматически при пуше в main/master и вручную кнопкой "Run workflow"
 on:
