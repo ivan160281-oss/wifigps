@@ -50,7 +50,7 @@ jobs:
         # скопируйте оттуда точный FQBN и подставьте его здесь вместо строки ниже.
         run: |
           ./bin/arduino-cli compile \
-            --fqbn "esp32:esp32:tlora_pager:PartitionScheme=huge_app" \
+            --fqbn "esp32:esp32:tlora_pager" \
             --export-binaries \
             gps_wifi_tracker
 
