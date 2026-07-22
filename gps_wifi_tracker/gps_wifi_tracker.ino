@@ -1,61 +1,46 @@
-/* 
- * GPS + WiFi tracker для LILYGO T-LoRa Pager (ESP32-S3)
- * -----------------------------------------------------
- * - Ждёт спутники GPS (MIA-M10Q), статус на экране: ПОДГОТОВКА -> ПОИСК -> ЗАПИСЬ
- * - При наличии фикса пишет CSV на SD: время (unix + iso), координаты, кол-во спутников
- * - Пока фикса нет - НИЧЕГО не пишет
- * - На экране: чёрный фон, красный трек, координаты, число спутников, статус
- * - Параллельно сканирует WiFi (асинхронно, не блокируя GPS/экран) и пишет
- *   все видимые сети (SSID, BSSID, канал, RSSI) в отдельный CSV
- * - Структура на SD:  /gps/YYYY-MM-DD/HH/track.csv
- *                      /gps/YYYY-MM-DD/HH/wifi.csv
+/*
+ * GPS + WiFi tracker для LILYGO T-LoRa Pager (ESP32-S3, LilyGoLib)
+ * -----------------------------------------------------------------
+ * - Статус на экране: ПОДГОТОВКА -> ПОИСК СПУТНИКОВ -> ЗАПИСЬ
+ * - Время (UTC) берётся с самого GPS
+ * - Пока нет фикса (валидные координаты + >= MIN_SATS_FOR_FIX спутников) - НИЧЕГО не пишем
+ * - На экране: чёрный фон, красный трек, координаты, число спутников
+ * - SD-карта: новая папка на каждый день и на каждый час:
+ *     /sd/gps/2026-07-22/14/track.csv
+ *     /sd/gps/2026-07-22/14/wifi.csv
+ * - Параллельно (без блокировки GPS/экрана) раз в WIFI_SCAN_INTERVAL_MS
+ *   сканируются WiFi-сети, все видимые сети (SSID, BSSID, канал, RSSI)
+ *   дописываются в wifi.csv
  *
- * Плата (Arduino IDE):  LilyGo-T-LoRa-Pager  (требуется arduino-esp32 >= 3.3.0-alpha1)
- * Библиотеки: LilyGoLib, LilyGoLib-ThirdParty (см. README.md), TinyGPSPlus
+ * Библиотека: LilyGoLib (официальная, https://github.com/Xinyuan-LilyGO/LilyGoLib)
+ * Плата (Arduino IDE / arduino-cli fqbn): esp32:esp32:tlora_pager
  */
 
-#include <Arduino.h>
 #include <LilyGoLib.h>
-#include <TinyGPSPlus.h>
-#include <SPI.h>
-#include <SD.h>
+#include <LV_Helper.h>
 #include <WiFi.h>
-
-// ---------------------------------------------------------------------------
-// Пины платы (официальная распиновка T-LoRaPager)
-// ---------------------------------------------------------------------------
-#define BOARD_DISP_CS       38
-#define BOARD_SPI_SCK       35
-#define BOARD_SPI_MOSI      34
-#define BOARD_SPI_MISO      33
-#define BOARD_SDCARD_CS     21
-#define RADIO_CS_PIN        36
-#define BOARD_NFC_CS        39
-#define BOARD_GPS_RX_PIN    12   // ESP32 RX <- GPS TX
-#define BOARD_GPS_TX_PIN     4   // ESP32 TX -> GPS RX
+#include <SD.h>
 
 // ---------------------------------------------------------------------------
 // Настройки
 // ---------------------------------------------------------------------------
-#define GPS_BAUD              9600
 #define WIFI_SCAN_INTERVAL_MS 30000UL   // период сканирования WiFi
-#define DISPLAY_UPDATE_MS     500UL     // период обновления текста на экране
-#define MAX_TRACK_POINTS      4000      // точек трека в памяти для отрисовки
-#define MIN_SATS_FOR_FIX      3         // минимум спутников, чтобы считать фикс валидным
+#define DISPLAY_UPDATE_MS     500UL     // период обновления текста статуса
+#define MAX_TRACK_POINTS      2000      // точек трека в памяти для отрисовки
+#define MIN_SATS_FOR_FIX      3         // минимум спутников для валидного фикса
 
-// Область экрана: 480x222
-#define SCR_W   480
-#define SCR_H   222
-#define HEADER_H 44                     // верхняя полоса с текстом
-#define TRACK_TOP  (HEADER_H + 2)
-#define TRACK_H  (SCR_H - TRACK_TOP)
+// SD монтируется LilyGoLib в точку /sd
+#define SD_ROOT "/sd/gps"
+
+// Область экрана 480x222, верхняя полоса - статус, ниже - трек
+#define SCR_W      480
+#define SCR_H      222
+#define HEADER_H   40
+#define TRACK_H    (SCR_H - HEADER_H)
 
 // ---------------------------------------------------------------------------
-// Глобальные объекты
+// Состояние
 // ---------------------------------------------------------------------------
-TinyGPSPlus gps;
-HardwareSerial gpsSerial(1);
-
 enum TrackerState { ST_INIT, ST_SEARCHING, ST_RECORDING };
 TrackerState state = ST_INIT;
 
@@ -65,23 +50,28 @@ static int trackCount = 0;
 static bool haveBBox = false;
 static float minLat, maxLat, minLon, maxLon;
 
-char currentDir[48] = "";     // текущая папка /gps/YYYY-MM-DD/HH
+char currentDir[64] = "";   // текущая папка /sd/gps/YYYY-MM-DD/HH
 bool sdReady = false;
 
 unsigned long lastDisplayUpdate = 0;
 unsigned long lastWifiScanStart = 0;
 bool wifiScanRunning = false;
 
+// LVGL объекты
+lv_obj_t *statusLabel;
+lv_obj_t *coordLabel;
+lv_obj_t *canvas;
+static void *canvasBuf = nullptr;
+
 // ---------------------------------------------------------------------------
-// Время: перевод даты/времени GPS (UTC) в unix timestamp без libc
-// (алгоритм Howard Hinnant, days_from_civil)
+// Время: unix timestamp из даты/времени GPS (UTC), без libc time()
 // ---------------------------------------------------------------------------
 static int64_t daysFromCivil(int y, int m, int d) {
     y -= (m <= 2);
     int64_t era = (y >= 0 ? y : y - 399) / 400;
-    unsigned yoe = (unsigned)(y - era * 400);              // [0, 399]
-    unsigned doy = (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1; // [0, 365]
-    unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;   // [0, 146096]
+    unsigned yoe = (unsigned)(y - era * 400);
+    unsigned doy = (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1;
+    unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
     return era * 146097LL + (int64_t)doe - 719468;
 }
 
@@ -92,32 +82,32 @@ static uint32_t toUnixTime(int y, int mo, int d, int h, int mi, int s) {
 
 static void isoTime(char *out, size_t outSize) {
     snprintf(out, outSize, "%04d-%02d-%02dT%02d:%02d:%02dZ",
-              gps.date.year(), gps.date.month(), gps.date.day(),
-              gps.time.hour(), gps.time.minute(), gps.time.second());
+             instance.gps.date.year(), instance.gps.date.month(), instance.gps.date.day(),
+             instance.gps.time.hour(), instance.gps.time.minute(), instance.gps.time.second());
 }
 
 // ---------------------------------------------------------------------------
 // SD: подготовка папки текущего часа
 // ---------------------------------------------------------------------------
 static bool ensureHourFolder() {
-    if (!gps.date.isValid() || !gps.time.isValid()) return false;
+    if (!sdReady) return false;
+    if (!instance.gps.date.isValid() || !instance.gps.time.isValid()) return false;
 
-    char dayDir[24];
-    char hourDir[48];
-    snprintf(dayDir, sizeof(dayDir), "/gps/%04d-%02d-%02d",
-              gps.date.year(), gps.date.month(), gps.date.day());
-    snprintf(hourDir, sizeof(hourDir), "%s/%02d", dayDir, gps.time.hour());
+    char dayDir[40];
+    char hourDir[64];
+    snprintf(dayDir, sizeof(dayDir), "%s/%04d-%02d-%02d", SD_ROOT,
+             instance.gps.date.year(), instance.gps.date.month(), instance.gps.date.day());
+    snprintf(hourDir, sizeof(hourDir), "%s/%02d", dayDir, instance.gps.time.hour());
 
-    if (strcmp(hourDir, currentDir) == 0) return true; // уже в этой папке
+    if (strcmp(hourDir, currentDir) == 0) return true;
 
-    if (!SD.exists("/gps"))   SD.mkdir("/gps");
-    if (!SD.exists(dayDir))   SD.mkdir(dayDir);
-    if (!SD.exists(hourDir))  SD.mkdir(hourDir);
+    if (!SD.exists(SD_ROOT)) SD.mkdir(SD_ROOT);
+    if (!SD.exists(dayDir))  SD.mkdir(dayDir);
+    if (!SD.exists(hourDir)) SD.mkdir(hourDir);
 
-    strncpy(currentDir, hourDir, sizeof(currentDir));
+    strncpy(currentDir, hourDir, sizeof(currentDir) - 1);
 
-    // создаём файлы с заголовками, если их ещё нет
-    char trackPath[80], wifiPath[80];
+    char trackPath[96], wifiPath[96];
     snprintf(trackPath, sizeof(trackPath), "%s/track.csv", currentDir);
     snprintf(wifiPath,  sizeof(wifiPath),  "%s/wifi.csv",  currentDir);
 
@@ -133,110 +123,117 @@ static bool ensureHourFolder() {
 }
 
 static void appendTrackPoint() {
-    if (!sdReady) return;
     if (!ensureHourFolder()) return;
 
-    char path[80];
+    char path[96];
     snprintf(path, sizeof(path), "%s/track.csv", currentDir);
     File f = SD.open(path, FILE_APPEND);
     if (!f) return;
 
     char iso[32];
     isoTime(iso, sizeof(iso));
-    uint32_t ts = toUnixTime(gps.date.year(), gps.date.month(), gps.date.day(),
-                              gps.time.hour(), gps.time.minute(), gps.time.second());
+    uint32_t ts = toUnixTime(instance.gps.date.year(), instance.gps.date.month(), instance.gps.date.day(),
+                             instance.gps.time.hour(), instance.gps.time.minute(), instance.gps.time.second());
 
     f.printf("%lu,%s,%.6f,%.6f,%.1f,%.1f,%d,%.2f\n",
-              (unsigned long)ts, iso,
-              gps.location.lat(), gps.location.lng(),
-              gps.altitude.isValid() ? gps.altitude.meters() : 0.0,
-              gps.speed.isValid() ? gps.speed.kmph() : 0.0,
-              gps.satellites.value(),
-              gps.hdop.isValid() ? gps.hdop.hdop() : 0.0);
+             (unsigned long)ts, iso,
+             instance.gps.location.lat(), instance.gps.location.lng(),
+             instance.gps.altitude.isValid() ? instance.gps.altitude.meters() : 0.0,
+             instance.gps.speed.isValid() ? instance.gps.speed.kmph() : 0.0,
+             instance.gps.satellites.value(),
+             instance.gps.hdop.isValid() ? instance.gps.hdop.hdop() : 0.0);
     f.close();
 }
 
 static void appendWifiResults(int n) {
-    if (!sdReady) return;
-    // используем время GPS если оно валидно, иначе millis-метку без времени
-    bool haveTime = gps.date.isValid() && gps.time.isValid();
-    if (!haveTime && strlen(currentDir) == 0) return; // некуда писать, пока не было ни одной папки
+    if (!sdReady || strlen(currentDir) == 0) return;
 
-    char path[80];
-    if (strlen(currentDir) == 0) return;
+    char path[96];
     snprintf(path, sizeof(path), "%s/wifi.csv", currentDir);
     File f = SD.open(path, FILE_APPEND);
     if (!f) return;
 
     char iso[32] = "unknown";
     uint32_t ts = 0;
+    bool haveTime = instance.gps.date.isValid() && instance.gps.time.isValid();
     if (haveTime) {
         isoTime(iso, sizeof(iso));
-        ts = toUnixTime(gps.date.year(), gps.date.month(), gps.date.day(),
-                         gps.time.hour(), gps.time.minute(), gps.time.second());
+        ts = toUnixTime(instance.gps.date.year(), instance.gps.date.month(), instance.gps.date.day(),
+                        instance.gps.time.hour(), instance.gps.time.minute(), instance.gps.time.second());
     }
 
     for (int i = 0; i < n; i++) {
         String ssid = WiFi.SSID(i);
-        ssid.replace(",", " ");   // защита от запятых в CSV
+        ssid.replace(",", " ");
         f.printf("%lu,%s,%s,%s,%d,%d\n",
-                  (unsigned long)ts, iso, ssid.c_str(),
-                  WiFi.BSSIDstr(i).c_str(), WiFi.channel(i), WiFi.RSSI(i));
+                 (unsigned long)ts, iso, ssid.c_str(),
+                 WiFi.BSSIDstr(i).c_str(), WiFi.channel(i), WiFi.RSSI(i));
     }
     f.close();
 }
 
 // ---------------------------------------------------------------------------
-// Экран
+// Экран (LVGL)
 // ---------------------------------------------------------------------------
-static void drawStatusHeader() {
-    board.display->fillRect(0, 0, SCR_W, HEADER_H, TFT_BLACK);
-    board.display->setTextColor(TFT_WHITE, TFT_BLACK);
-    board.display->setTextSize(2);
-
+static void updateStatusText() {
     const char *statusText;
     switch (state) {
-        case ST_INIT:       statusText = "ПОДГОТОВКА...";        break;
-        case ST_SEARCHING:  statusText = "ПОИСК СПУТНИКОВ...";   break;
-        case ST_RECORDING:  statusText = "ЗАПИСЬ";               break;
-        default:            statusText = "";                     break;
+        case ST_INIT:      statusText = "ПОДГОТОВКА...";      break;
+        case ST_SEARCHING: statusText = "ПОИСК СПУТНИКОВ...";  break;
+        case ST_RECORDING: statusText = "ЗАПИСЬ";              break;
+        default:           statusText = "";                    break;
     }
-    board.display->setCursor(4, 2);
-    board.display->print(statusText);
 
-    board.display->setTextSize(1);
-    board.display->setCursor(4, 24);
-    if (gps.location.isValid()) {
-        board.display->printf("Lat:%.6f Lon:%.6f", gps.location.lat(), gps.location.lng());
+    if (instance.gps.location.isValid()) {
+        lv_label_set_text_fmt(coordLabel, "Lat:%.6f  Lon:%.6f   Sat:%d",
+                               instance.gps.location.lat(), instance.gps.location.lng(),
+                               instance.gps.satellites.isValid() ? instance.gps.satellites.value() : 0);
     } else {
-        board.display->print("Lat: --.------ Lon: --.------");
+        lv_label_set_text_fmt(coordLabel, "Lat:--.------  Lon:--.------   Sat:%d",
+                               instance.gps.satellites.isValid() ? instance.gps.satellites.value() : 0);
     }
-    board.display->setCursor(360, 24);
-    board.display->printf("Sat:%2d", gps.satellites.isValid() ? gps.satellites.value() : 0);
+    lv_label_set_text(statusLabel, statusText);
 }
 
-static void mapLatLonToScreen(float lat, float lon, int &x, int &y) {
+static void mapLatLonToCanvas(float lat, float lon, int32_t &x, int32_t &y) {
     float spanLat = (maxLat - minLat);
     float spanLon = (maxLon - minLon);
     if (spanLat < 0.00005f) spanLat = 0.00005f;
     if (spanLon < 0.00005f) spanLon = 0.00005f;
 
-    // немного отступов по краям
     float px = (lon - minLon) / spanLon;
-    float py = (lat - maxLat) / (-spanLat); // инверсия: широта растёт вверх
+    float py = (lat - maxLat) / (-spanLat);
 
-    x = (int)(px * (SCR_W - 8)) + 4;
-    y = TRACK_TOP + (int)(py * (TRACK_H - 8)) + 4;
+    x = (int32_t)(px * (SCR_W - 8)) + 4;
+    y = (int32_t)(py * (TRACK_H - 8)) + 4;
+}
+
+// Рисует один красный отрезок на канвасе (LVGL v9: через layer + lv_draw_line)
+static void drawTrackSegment(int32_t x0, int32_t y0, int32_t x1, int32_t y1) {
+    lv_layer_t layer;
+    lv_canvas_init_layer(canvas, &layer);
+
+    lv_draw_line_dsc_t dsc;
+    lv_draw_line_dsc_init(&dsc);
+    dsc.color = lv_color_make(255, 0, 0);
+    dsc.width = 2;
+    dsc.round_start = 1;
+    dsc.round_end = 1;
+    dsc.p1.x = x0; dsc.p1.y = y0;
+    dsc.p2.x = x1; dsc.p2.y = y1;
+    lv_draw_line(&layer, &dsc);
+
+    lv_canvas_finish_layer(canvas, &layer);
 }
 
 static void redrawFullTrack() {
-    board.display->fillRect(0, TRACK_TOP, SCR_W, TRACK_H, TFT_BLACK);
+    lv_canvas_fill_bg(canvas, lv_color_black(), LV_OPA_COVER);
     if (trackCount < 2) return;
-    int x0, y0, x1, y1;
-    mapLatLonToScreen(track[0].lat, track[0].lon, x0, y0);
+    int32_t x0, y0, x1, y1;
+    mapLatLonToCanvas(track[0].lat, track[0].lon, x0, y0);
     for (int i = 1; i < trackCount; i++) {
-        mapLatLonToScreen(track[i].lat, track[i].lon, x1, y1);
-        board.display->drawLine(x0, y0, x1, y1, TFT_RED);
+        mapLatLonToCanvas(track[i].lat, track[i].lon, x1, y1);
+        drawTrackSegment(x0, y0, x1, y1);
         x0 = x1; y0 = y1;
     }
 }
@@ -248,6 +245,7 @@ static void addTrackPointAndDraw(float lat, float lon) {
         minLat = maxLat = lat;
         minLon = maxLon = lon;
         haveBBox = true;
+        needFullRedraw = true; // первая точка - просто очищаем канвас
     } else {
         if (lat < minLat) { minLat = lat; needFullRedraw = true; }
         if (lat > maxLat) { maxLat = lat; needFullRedraw = true; }
@@ -255,16 +253,15 @@ static void addTrackPointAndDraw(float lat, float lon) {
         if (lon > maxLon) { maxLon = lon; needFullRedraw = true; }
     }
 
-    int prevX = 0, prevY = 0;
+    int32_t prevX = 0, prevY = 0;
     bool hadPrev = (trackCount > 0);
-    if (hadPrev) mapLatLonToScreen(track[trackCount - 1].lat, track[trackCount - 1].lon, prevX, prevY);
+    if (hadPrev) mapLatLonToCanvas(track[trackCount - 1].lat, track[trackCount - 1].lon, prevX, prevY);
 
     if (trackCount < MAX_TRACK_POINTS) {
         track[trackCount].lat = lat;
         track[trackCount].lon = lon;
         trackCount++;
     } else {
-        // сдвигаем буфер, теряя самую старую точку (упрощённо)
         memmove(&track[0], &track[1], sizeof(Pt) * (MAX_TRACK_POINTS - 1));
         track[MAX_TRACK_POINTS - 1].lat = lat;
         track[MAX_TRACK_POINTS - 1].lon = lon;
@@ -273,9 +270,9 @@ static void addTrackPointAndDraw(float lat, float lon) {
     if (needFullRedraw) {
         redrawFullTrack();
     } else if (hadPrev) {
-        int x1, y1;
-        mapLatLonToScreen(lat, lon, x1, y1);
-        board.display->drawLine(prevX, prevY, x1, y1, TFT_RED);
+        int32_t x1, y1;
+        mapLatLonToCanvas(lat, lon, x1, y1);
+        drawTrackSegment(prevX, prevY, x1, y1);
     }
 }
 
@@ -285,41 +282,65 @@ static void addTrackPointAndDraw(float lat, float lon) {
 void setup() {
     Serial.begin(115200);
 
-    board.begin();  // инициализация экрана, питания, XL9555 и т.д. (LilyGoLib)
+    // Инициализация платы: экран, питание, клавиатура, GPS (Serial1 38400 baud), и т.д.
+    instance.begin();
 
-    board.display->fillScreen(TFT_BLACK);
-    board.display->setTextColor(TFT_WHITE, TFT_BLACK);
-    drawStatusHeader();
+    beginLvglHelper(instance);
 
-    // GPS UART
-    gpsSerial.begin(GPS_BAUD, SERIAL_8N1, BOARD_GPS_RX_PIN, BOARD_GPS_TX_PIN);
+    instance.setBrightness(DEVICE_MAX_BRIGHTNESS_LEVEL);
 
-    // Гарантируем, что остальные устройства на общей SPI-шине отпущены
-    pinMode(RADIO_CS_PIN, OUTPUT);   digitalWrite(RADIO_CS_PIN, HIGH);
-    pinMode(BOARD_NFC_CS, OUTPUT);   digitalWrite(BOARD_NFC_CS, HIGH);
+    // Чёрный фон на весь экран
+    lv_obj_set_style_bg_color(lv_screen_active(), lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(lv_screen_active(), LV_OPA_COVER, 0);
 
-    SPI.begin(BOARD_SPI_SCK, BOARD_SPI_MISO, BOARD_SPI_MOSI);
-    sdReady = SD.begin(BOARD_SDCARD_CS);
+    // Статус (верхняя строка)
+    statusLabel = lv_label_create(lv_screen_active());
+    lv_obj_set_style_text_color(statusLabel, lv_color_white(), 0);
+    lv_obj_set_style_text_font(statusLabel, &lv_font_montserrat_20, 0);
+    lv_obj_align(statusLabel, LV_ALIGN_TOP_LEFT, 4, 2);
+    lv_label_set_text(statusLabel, "ПОДГОТОВКА...");
+
+    // Координаты + спутники (вторая строка)
+    coordLabel = lv_label_create(lv_screen_active());
+    lv_obj_set_style_text_color(coordLabel, lv_color_white(), 0);
+    lv_obj_align(coordLabel, LV_ALIGN_TOP_LEFT, 4, 24);
+    lv_label_set_text(coordLabel, "Lat:--.------  Lon:--.------   Sat:0");
+
+    // Канвас для красного трека (нижняя часть экрана)
+    size_t bufSize = (size_t)SCR_W * TRACK_H * 2; // RGB565 = 2 байта/пиксель
+    canvasBuf = ps_malloc(bufSize);
+    canvas = lv_canvas_create(lv_screen_active());
+    lv_canvas_set_buffer(canvas, canvasBuf, SCR_W, TRACK_H, LV_COLOR_FORMAT_RGB565);
+    lv_obj_align(canvas, LV_ALIGN_TOP_LEFT, 0, HEADER_H);
+    lv_canvas_fill_bg(canvas, lv_color_black(), LV_OPA_COVER);
+
+    lv_timer_handler();
+
+    // SD карта (LilyGoLib монтирует её в /sd)
+    int retry = 5;
+    do {
+        sdReady = instance.installSD();
+        if (!sdReady) delay(500);
+    } while (!sdReady && --retry > 0);
+
     if (!sdReady) {
         Serial.println("SD init failed!");
     }
 
-    // WiFi только на сканирование, без подключения
+    // WiFi только на сканирование, без подключения к сети
     WiFi.mode(WIFI_STA);
     WiFi.disconnect();
 
     state = ST_SEARCHING;
-    drawStatusHeader();
+    updateStatusText();
 }
 
 static void handleGPS() {
-    while (gpsSerial.available()) {
-        gps.encode(gpsSerial.read());
-    }
+    instance.gps.loop();   // читает Serial1 и скармливает данные внутреннему TinyGPSPlus
 
-    bool fixOk = gps.location.isValid() &&
-                 gps.satellites.isValid() &&
-                 gps.satellites.value() >= MIN_SATS_FOR_FIX;
+    bool fixOk = instance.gps.location.isValid() &&
+                 instance.gps.satellites.isValid() &&
+                 instance.gps.satellites.value() >= MIN_SATS_FOR_FIX;
 
     if (fixOk && state != ST_RECORDING) {
         state = ST_RECORDING;
@@ -327,16 +348,16 @@ static void handleGPS() {
         state = ST_SEARCHING;
     }
 
-    if (fixOk && gps.location.isUpdated()) {
+    if (fixOk && instance.gps.location.isUpdated()) {
         appendTrackPoint();
-        addTrackPointAndDraw(gps.location.lat(), gps.location.lng());
+        addTrackPointAndDraw(instance.gps.location.lat(), instance.gps.location.lng());
     }
 }
 
 static void handleWifiScan() {
     unsigned long now = millis();
 
-    if (!wifiScanRunning && (now - lastWifiScanStart >= WIFI_SCAN_INTERVAL_MS || lastWifiScanStart == 0)) {
+    if (!wifiScanRunning && (lastWifiScanStart == 0 || now - lastWifiScanStart >= WIFI_SCAN_INTERVAL_MS)) {
         WiFi.scanNetworks(true /* async */, true /* show_hidden */);
         wifiScanRunning = true;
         lastWifiScanStart = now;
@@ -351,7 +372,6 @@ static void handleWifiScan() {
         } else if (n == WIFI_SCAN_FAILED) {
             wifiScanRunning = false;
         }
-        // n == WIFI_SCAN_RUNNING (-1) -> просто ждём, не блокируя loop()
     }
 }
 
@@ -361,7 +381,10 @@ void loop() {
 
     unsigned long now = millis();
     if (now - lastDisplayUpdate >= DISPLAY_UPDATE_MS) {
-        drawStatusHeader();
+        updateStatusText();
         lastDisplayUpdate = now;
     }
+
+    lv_timer_handler();
+    delay(2);
 }
