@@ -1,4 +1,4 @@
-name: Build T-LoRa Pager firmware
+name: .github/workflows/build.yml
 
 # Собирается автоматически при пуше в main/master и вручную кнопкой "Run workflow"
 on:
@@ -7,7 +7,7 @@ on:
   workflow_dispatch: {}
 
 jobs:
-  build:
+  build: 
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repo
