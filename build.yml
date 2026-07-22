@@ -1,0 +1,54 @@
+name: Build T-LoRa Pager firmware
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch: {}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Install arduino-cli
+        run: |
+          curl -fsSL https://raw.githubusercontent.com/arduino/arduino-cli/master/install.sh | sh
+          echo "$PWD/bin" >> "$GITHUB_PATH"
+
+      - name: Add ESP32 board index
+        run: |
+          ./bin/arduino-cli config init
+          ./bin/arduino-cli config add board_manager.additional_urls https://espressif.github.io/arduino-esp32/package_esp32_dev_index.json
+
+      - name: Update index and install ESP32 core (>=3.3.0-alpha1)
+        run: |
+          ./bin/arduino-cli core update-index
+          ./bin/arduino-cli core install esp32:esp32
+
+      - name: Install LilyGoLib
+        run: |
+          mkdir -p ~/Arduino/libraries
+          git clone --depth 1 https://github.com/Xinyuan-LilyGO/LilyGoLib.git ~/Arduino/libraries/LilyGoLib
+
+      - name: Install LilyGoLib-ThirdParty libraries
+        run: |
+          git clone --depth 1 https://github.com/Xinyuan-LilyGO/LilyGoLib-ThirdParty.git /tmp/thirdparty
+          find /tmp/thirdparty -maxdepth 1 -mindepth 1 -type d -exec cp -r {} ~/Arduino/libraries/ \;
+
+      - name: Install TinyGPSPlus
+        run: ./bin/arduino-cli lib install TinyGPSPlus
+
+      - name: Compile firmware
+        run: |
+          ./bin/arduino-cli compile \
+            --fqbn "esp32:esp32:tlora_pager" \
+            --export-binaries \
+            gps_wifi_tracker
+
+      - name: Upload .bin as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tpager-gps-wifi-tracker-bin
+          path: gps_wifi_tracker/build/**/*.bin
