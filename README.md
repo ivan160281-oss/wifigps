@@ -24,10 +24,11 @@
 - a new file every 30 minutes of recording: `log_YYYYMMDD_HHMMSS.txt` (name uses local
   UTC+3 time at file-creation time)
 - one line every 30 seconds, ALWAYS written (even with no GPS fix), format:
-  `HH:MM:SS_lat_lon_status_speed_wifi1,wifi2,wifi3` - `status` is `ok` when the fix is
-  valid or `bad_gps` otherwise (lat/lon are `0.000000` in that case); `speed` is km/h
-  (average of the last 5 fixes) or `NA` if not enough data yet; nothing after the last
-  `_` if no WiFi networks are visible
+  `HH:MM:SS_lat_lon_status_speed_ssid1|bssid1|rssi1,ssid2|bssid2|rssi2,...` - `status`
+  is `ok` when the fix is valid or `bad_gps` otherwise (lat/lon are `0.000000` in that
+  case); `speed` is km/h (average of the last 5 fixes) or `NA` if not enough data yet;
+  each WiFi network is logged as `ssid|bssid|rssi` (bssid = MAC address, rssi = signal
+  strength in dBm); nothing after the last `_` if no WiFi networks are visible
 - the red track and the speed calculation still only use points with a valid fix -
   `bad_gps` rows don't affect the drawn track
 

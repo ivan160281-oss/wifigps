@@ -15,11 +15,13 @@
  *  - SD card: /sd/WIFIGPS/ folder, file log_YYYYMMDD_HHMMSS.txt
  *    (new file every 30 minutes of recording)
  *  - One line written every 30 seconds, ALWAYS (even with no GPS fix):
- *    HH:MM:SS_lat_lon_status_speed_wifi1,wifi2,wifi3
+ *    HH:MM:SS_lat_lon_status_speed_ssid1|bssid1|rssi1,ssid2|bssid2|rssi2,...
  *    status is "ok" when the fix is valid, "bad_gps" otherwise (lat/lon are
  *    written as 0.000000 in that case). speed is km/h (average of the last
- *    5 fixes) or "NA" if not enough data yet. If no networks are visible,
- *    nothing follows the last "_".
+ *    5 fixes) or "NA" if not enough data yet. Each WiFi network is logged as
+ *    ssid|bssid|rssi (bssid = MAC address, rssi = signal strength in dBm);
+ *    networks are comma-separated. If no networks are visible, nothing
+ *    follows the last "_".
  *  - WiFi scanning is asynchronous and never blocks GPS/display
  *
  * Library: LilyGoLib (https://github.com/Xinyuan-LilyGO/LilyGoLib)
@@ -222,7 +224,7 @@ static bool openNewLogFile() {
 }
 
 // Writes one line to the current file every 30 sec, always - even with no GPS fix.
-// Format: HH:MM:SS_lat_lon_status_speed_wifi1,wifi2,...
+// Format: HH:MM:SS_lat_lon_status_speed_ssid1|bssid1|rssi1,ssid2|bssid2|rssi2,...
 // status is "ok" when the GPS fix is valid, "bad_gps" otherwise (no fix / not enough satellites).
 // speed is km/h (average of the last 5 fixes), or "NA" if not enough data yet.
 static void writeLogLine() {
@@ -280,15 +282,22 @@ static void handleWifiScan() {
             lastWifiCount = n;
             sessionWifiScansTotal += n;
 
-            String ssids = "";
+            // Each entry: ssid|bssid|rssi , separated by commas between networks.
+            // ssid is sanitized so it can't contain '_', ',' or '|' (our delimiters).
+            String entries = "";
             for (int i = 0; i < n; i++) {
                 String ssid = WiFi.SSID(i);
                 ssid.replace(",", " ");
                 ssid.replace("_", " ");
-                if (i > 0) ssids += ",";
-                ssids += ssid;
+                ssid.replace("|", " ");
+                if (i > 0) entries += ",";
+                entries += ssid;
+                entries += "|";
+                entries += WiFi.BSSIDstr(i);
+                entries += "|";
+                entries += String(WiFi.RSSI(i));
             }
-            lastWifiSSIDs = ssids;
+            lastWifiSSIDs = entries;
 
             WiFi.scanDelete();
             wifiScanRunning = false;
