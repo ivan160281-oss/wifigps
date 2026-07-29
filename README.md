@@ -12,6 +12,19 @@
 **ENTER** while recording -> stops recording (file is flushed and closed), back to idle screen.
 **E** (any time except when already stopped) -> full stop: file is closed, screen shows
 "Application stopped", device does nothing further (reboot required to run again).
+**S** (from idle or while recording) -> on-device self-diagnostics screen (see below).
+Press **S** or **ENTER** again to return to whatever screen you were on before.
+
+**Self-diagnostics screen (no USB/serial monitor needed):**
+- GPS: fix status, satellite count, raw NMEA counters (characters processed,
+  sentences with a fix, failed checksums - useful to confirm the GPS module is
+  actually talking at all), lat/lon/altitude/speed/HDOP
+- WiFi: how many networks in the last scan, plus up to 4 of them with their RSSI
+- Meshtastic: which of the two known channels is currently tuned, total sightings
+  heard since boot, and the last node heard (id, RSSI, how many seconds ago)
+- SD card status, free heap, free PSRAM
+- If a recording session is active, it keeps running in the background (file
+  writes and track drawing continue) while you're looking at this screen
 
 **While recording, on screen:**
 - red track on a black background (bottom part of the screen)

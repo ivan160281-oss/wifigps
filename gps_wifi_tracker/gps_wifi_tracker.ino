@@ -9,6 +9,12 @@
  *    back to idle screen
  *  - "E" - full exit: recording stops, file is closed, device shows a
  *    "stopped" screen and does nothing further (reboot required)
+ *  - "S" (from idle or while recording) - on-device self-diagnostics screen:
+ *    live GPS stats (fix status, sats, raw NMEA counters, lat/lon/alt/speed/
+ *    hdop), last WiFi scan (SSID + RSSI), Meshtastic status (current channel,
+ *    total heard since boot, last node heard + RSSI + seconds ago), SD status,
+ *    free heap/PSRAM. Recording (if active) keeps running in the background
+ *    while this screen is shown. "S" or ENTER returns to the previous screen.
  *  - While recording: table (satellites, coordinates, visible WiFi count,
  *    speed - average of last 5 points, current file size) + red track on
  *    a black background
@@ -94,8 +100,9 @@ static const MeshtasticChannel MESHTASTIC_CHANNELS[] = {
 // ---------------------------------------------------------------------------
 // Application state
 // ---------------------------------------------------------------------------
-enum AppState { APP_IDLE, APP_RECORDING, APP_STOPPED };
+enum AppState { APP_IDLE, APP_RECORDING, APP_STOPPED, APP_DIAG };
 AppState appState = APP_IDLE;
+AppState diagReturnState = APP_IDLE; // which screen to go back to when leaving diagnostics
 
 struct Pt { float lat, lon; uint32_t ts; };
 static Pt track[MAX_TRACK_POINTS];
@@ -126,6 +133,16 @@ unsigned long sessionLoraSightingsTotal = 0;
 volatile bool loraPacketReady = false;
 int currentMeshtasticChannelIdx = 0;
 unsigned long lastChannelSwitchMs = 0;
+
+// Boot-scoped Meshtastic stats (never reset by start/stop recording) - used by
+// the on-device diagnostics screen.
+unsigned long bootLoraSightingsTotal = 0;
+String lastMeshtasticId = "";
+int lastMeshtasticRssi = 0;
+unsigned long lastMeshtasticMs = 0;
+
+lv_obj_t *diagScreen;
+lv_obj_t *diagLabel;
 
 unsigned long lastDisplayUpdate = 0;
 unsigned long lastWifiScanStart = 0;
@@ -430,6 +447,11 @@ static bool setupLoraListener() {
 // Skips duplicates of an id already buffered in this window (keeps the
 // strongest RSSI seen for it instead).
 static void bufferLoraSighting(const String &id, int rssi) {
+    lastMeshtasticId = id;
+    lastMeshtasticRssi = rssi;
+    lastMeshtasticMs = millis();
+    bootLoraSightingsTotal++;
+
     for (int i = 0; i < loraBufferCount; i++) {
         if (loraBufferIds[i] == id) {
             if (rssi > loraBufferRssi[i]) loraBufferRssi[i] = rssi;
@@ -611,7 +633,7 @@ static void buildIdleScreen() {
     lv_obj_set_style_text_color(idleHintLabel, lv_color_make(255, 60, 60), 0);
     lv_obj_set_style_text_font(idleHintLabel, &lv_font_montserrat_20, 0);
     lv_obj_align(idleHintLabel, LV_ALIGN_BOTTOM_LEFT, 8, -8);
-    lv_label_set_text(idleHintLabel, "ENTER - start recording");
+    lv_label_set_text(idleHintLabel, "ENTER - start   |   S - diagnostics   |   E - exit");
 }
 
 static void buildRecScreen() {
@@ -643,6 +665,17 @@ static void buildStoppedScreen() {
     lv_obj_center(label);
 }
 
+static void buildDiagScreen() {
+    diagScreen = lv_obj_create(NULL);
+    lv_obj_set_style_bg_color(diagScreen, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(diagScreen, LV_OPA_COVER, 0);
+
+    diagLabel = lv_label_create(diagScreen);
+    lv_obj_set_style_text_color(diagLabel, lv_color_make(120, 255, 120), 0); // terminal-green
+    lv_obj_set_style_text_font(diagLabel, &lv_font_montserrat_14, 0);
+    lv_obj_align(diagLabel, LV_ALIGN_TOP_LEFT, 6, 4);
+}
+
 static void updateIdleScreen() {
     bool fixOk = instance.gps.location.isValid() &&
                  instance.gps.satellites.isValid() &&
@@ -671,7 +704,7 @@ static void updateIdleScreen() {
     if (!sdReady) {
         lv_label_set_text(idleHintLabel, "SD card not found! Recording unavailable.");
     } else {
-        lv_label_set_text(idleHintLabel, "ENTER - start recording   |   E - exit");
+        lv_label_set_text(idleHintLabel, "ENTER - start   |   S - diagnostics   |   E - exit");
     }
 }
 
@@ -703,9 +736,86 @@ static void updateRecScreen() {
     }
 }
 
-// ---------------------------------------------------------------------------
-// State transitions
-// ---------------------------------------------------------------------------
+// Formats up to maxEntries WiFi sightings from lastWifiSSIDs ("ssid|bssid|rssi,...")
+// as "  ssid (rssi dBm)" lines, for the diagnostics screen.
+static String formatWifiListForDiag(int maxEntries) {
+    if (lastWifiSSIDs.length() == 0) return "  (none)";
+    String out = "";
+    int start = 0;
+    int shown = 0;
+    while (start < (int)lastWifiSSIDs.length() && shown < maxEntries) {
+        int comma = lastWifiSSIDs.indexOf(',', start);
+        String entry = (comma == -1) ? lastWifiSSIDs.substring(start) : lastWifiSSIDs.substring(start, comma);
+        int p1 = entry.indexOf('|');
+        int p2 = (p1 == -1) ? -1 : entry.indexOf('|', p1 + 1);
+        if (p1 != -1 && p2 != -1) {
+            String ssid = entry.substring(0, p1);
+            if (ssid.length() == 0) ssid = "(hidden)";
+            String rssi = entry.substring(p2 + 1);
+            out += "  " + ssid + " (" + rssi + " dBm)\n";
+            shown++;
+        }
+        if (comma == -1) break;
+        start = comma + 1;
+    }
+    if (shown == 0) return "  (none)";
+    return out;
+}
+
+static void updateDiagScreen() {
+    bool fixOk = instance.gps.location.isValid() &&
+                 instance.gps.satellites.isValid() &&
+                 instance.gps.satellites.value() >= MIN_SATS_FOR_FIX;
+
+    char gpsLine[80];
+    if (instance.gps.location.isValid()) {
+        snprintf(gpsLine, sizeof(gpsLine), "Lat:%.6f Lon:%.6f Alt:%.0fm Spd:%.1fkm/h HDOP:%.1f",
+                 instance.gps.location.lat(), instance.gps.location.lng(),
+                 instance.gps.altitude.isValid() ? instance.gps.altitude.meters() : 0.0,
+                 instance.gps.speed.isValid() ? instance.gps.speed.kmph() : 0.0,
+                 instance.gps.hdop.isValid() ? instance.gps.hdop.hdop() : 0.0);
+    } else {
+        snprintf(gpsLine, sizeof(gpsLine), "Lat:--.------ Lon:--.------ (no fix yet)");
+    }
+
+    unsigned long meshAgoSec = (lastMeshtasticMs > 0) ? (millis() - lastMeshtasticMs) / 1000 : 0;
+    char meshLastLine[64];
+    if (lastMeshtasticMs > 0) {
+        snprintf(meshLastLine, sizeof(meshLastLine), "%s, rssi %d dBm, %lus ago",
+                 lastMeshtasticId.c_str(), lastMeshtasticRssi, meshAgoSec);
+    } else {
+        strcpy(meshLastLine, "(none heard yet)");
+    }
+
+    lv_label_set_text_fmt(diagLabel,
+        "SELF-DIAGNOSTICS   (S or ENTER to exit)\n"
+        "\n"
+        "GPS: %s, sats:%d, chars:%lu, sentences:%lu, failed-cksum:%lu\n"
+        "%s\n"
+        "\n"
+        "WiFi: last scan %d networks\n"
+        "%s"
+        "\n"
+        "Meshtastic: channel %s (%.6f MHz), heard total:%lu\n"
+        "  last: %s\n"
+        "\n"
+        "SD: %s   Free heap: %lu KB   Free PSRAM: %lu KB",
+        fixOk ? "FIX" : "searching",
+        instance.gps.satellites.isValid() ? instance.gps.satellites.value() : 0,
+        instance.gps.charsProcessed(), instance.gps.sentencesWithFix(), instance.gps.failedChecksum(),
+        gpsLine,
+        lastWifiCount,
+        formatWifiListForDiag(4).c_str(),
+        MESHTASTIC_CHANNELS[currentMeshtasticChannelIdx].tag,
+        MESHTASTIC_CHANNELS[currentMeshtasticChannelIdx].freqMHz,
+        bootLoraSightingsTotal,
+        meshLastLine,
+        sdReady ? "ready" : "NOT FOUND",
+        (unsigned long)(ESP.getFreeHeap() / 1024),
+        (unsigned long)(ESP.getFreePsram() / 1024));
+}
+
+
 static void startRecording() {
     if (!sdReady) return; // no SD card -> do not start recording
     sessionLinesWritten = 0;
@@ -748,10 +858,22 @@ static void handleKeyboard() {
             startRecording();
         } else if (appState == APP_RECORDING) {
             stopRecording();
+        } else if (appState == APP_DIAG) {
+            appState = diagReturnState;
+            lv_scr_load(appState == APP_RECORDING ? recScreen : idleScreen);
         }
     } else if (c == 'e' || c == 'E') {
         if (appState != APP_STOPPED) {
             exitApplication();
+        }
+    } else if (c == 's' || c == 'S') {
+        if (appState == APP_DIAG) {
+            appState = diagReturnState;
+            lv_scr_load(appState == APP_RECORDING ? recScreen : idleScreen);
+        } else if (appState == APP_IDLE || appState == APP_RECORDING) {
+            diagReturnState = appState;
+            appState = APP_DIAG;
+            lv_scr_load(diagScreen);
         }
     }
 }
@@ -802,6 +924,7 @@ void setup() {
     buildIdleScreen();
     buildRecScreen();
     buildStoppedScreen();
+    buildDiagScreen();
     lv_scr_load(idleScreen);
     lv_timer_handler();
 
@@ -839,10 +962,12 @@ void loop() {
     handleWifiScan();
     handleLoraRx();
 
-    if (appState == APP_RECORDING) {
+    bool recordingActive = (appState == APP_RECORDING) ||
+                            (appState == APP_DIAG && diagReturnState == APP_RECORDING);
+    if (recordingActive) {
         handleRecording();
     } else {
-        // Idle: still read GPS so the status shown on screen stays current
+        // Idle/diagnostics-from-idle: still read GPS so the status shown stays current
         instance.gps.loop();
     }
 
@@ -850,6 +975,7 @@ void loop() {
     if (now - lastDisplayUpdate >= DISPLAY_UPDATE_MS) {
         if (appState == APP_IDLE) updateIdleScreen();
         else if (appState == APP_RECORDING) updateRecScreen();
+        else if (appState == APP_DIAG) updateDiagScreen();
         lastDisplayUpdate = now;
     }
 
