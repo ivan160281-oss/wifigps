@@ -24,13 +24,37 @@
 - a new file every 30 minutes of recording: `log_YYYYMMDD_HHMMSS.txt` (name uses local
   UTC+3 time at file-creation time)
 - one line every 30 seconds, ALWAYS written (even with no GPS fix), format:
-  `HH:MM:SS_lat_lon_status_speed_ssid1|bssid1|rssi1,ssid2|bssid2|rssi2,...` - `status`
-  is `ok` when the fix is valid or `bad_gps` otherwise (lat/lon are `0.000000` in that
-  case); `speed` is km/h (average of the last 5 fixes) or `NA` if not enough data yet;
-  each WiFi network is logged as `ssid|bssid|rssi` (bssid = MAC address, rssi = signal
-  strength in dBm); nothing after the last `_` if no WiFi networks are visible
+  `HH:MM:SS_lat_lon_status_speed_ssid1|bssid1|rssi1,ssid2|bssid2|rssi2,..._M1:node1|rssi1,M2:node2|rssi2,...`
+  - `status` is `ok` when the fix is valid or `bad_gps` otherwise (lat/lon are `0.000000`
+    in that case)
+  - `speed` is km/h (average of the last 5 fixes) or `NA` if not enough data yet
+  - each WiFi network is logged as `ssid|bssid|rssi` (bssid = MAC address, rssi = signal
+    strength in dBm)
+  - each Meshtastic sighting is logged as `<channel_tag>:<node_id>|rssi`, where
+    `channel_tag` is `M1` or `M2` (which known local channel it was heard on) and
+    `node_id` is the sender's permanent, MAC-derived Meshtastic node number
+  - nothing sits between the surrounding `_` separators if a list is empty
 - the red track and the speed calculation still only use points with a valid fix -
   `bad_gps` rows don't affect the drawn track
+
+**About the Meshtastic field (passive listening, no network join, no transmit):**
+[Meshtastic](https://meshtastic.org/) is an open mesh-messaging protocol run over LoRa
+by enthusiasts (not LoRaWAN). Its packet header is never encrypted - only the payload
+past the 16-byte header is - so the sender's node id can be read directly, with no
+encryption key needed. The SX1262 alternates every ~20 seconds between two known local
+channels (Moscow region):
+- `M1`: 868.731018 MHz, 62.5 kHz bandwidth, SF7, coding rate 4/7
+- `M2`: 869.075 MHz (MEDIUM_FAST preset, frequency slot 2), 250 kHz bandwidth, SF9,
+  coding rate 4/5
+
+Both use the Meshtastic protocol's fixed sync word (0x2B) and preamble length (16).
+Since a single radio can only listen to one channel/config at a time, alternating
+between the two only ever catches a share of the local traffic on each - it's a
+best-effort supplementary data source (much longer range than WiFi), not an exhaustive
+scanner. There's no existing public database mapping Meshtastic node ids to real-world
+coordinates, so (exactly like WiFi) any positioning value has to come from your own
+accumulated observations over time. If you know of more local channels in use, add
+them to the `MESHTASTIC_CHANNELS` array near the top of the sketch.
 
 **WiFi scanning** is asynchronous, every 15 sec, never blocks GPS or the display.
 

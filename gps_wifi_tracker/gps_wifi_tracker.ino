@@ -1,5 +1,5 @@
 /*
- * GPS + WiFi tracker for LILYGO T-LoRa Pager (ESP32-S3, LilyGoLib)
+ * GPS + WiFi + LoRa tracker for LILYGO T-LoRa Pager (ESP32-S3, LilyGoLib)
  * -----------------------------------------------------------------
  * Behaviour:
  *  - Idle screen (not recording): GPS status, WiFi status, time (UTC+3),
@@ -12,17 +12,28 @@
  *  - While recording: table (satellites, coordinates, visible WiFi count,
  *    speed - average of last 5 points, current file size) + red track on
  *    a black background
- *  - SD card: /sd/WIFIGPS/ folder, file log_YYYYMMDD_HHMMSS.txt
+ *  - SD card: /WIFIGPS folder at the SD root, file log_YYYYMMDD_HHMMSS.txt
  *    (new file every 30 minutes of recording)
  *  - One line written every 30 seconds, ALWAYS (even with no GPS fix):
- *    HH:MM:SS_lat_lon_status_speed_ssid1|bssid1|rssi1,ssid2|bssid2|rssi2,...
+ *    HH:MM:SS_lat_lon_status_speed_ssid1|bssid1|rssi1,ssid2|bssid2|rssi2,..._M1:node1|rssi1,M2:node2|rssi2,...
  *    status is "ok" when the fix is valid, "bad_gps" otherwise (lat/lon are
  *    written as 0.000000 in that case). speed is km/h (average of the last
  *    5 fixes) or "NA" if not enough data yet. Each WiFi network is logged as
  *    ssid|bssid|rssi (bssid = MAC address, rssi = signal strength in dBm);
- *    networks are comma-separated. If no networks are visible, nothing
- *    follows the last "_".
+ *    networks are comma-separated. Each Meshtastic sighting is logged as
+ *    <channel_tag>:<node_id_hex>|rssi (node_id is the sender's permanent,
+ *    MAC-derived Meshtastic node number). If a list is empty, nothing sits
+ *    between its surrounding "_" separators.
  *  - WiFi scanning is asynchronous and never blocks GPS/display
+ *  - LoRa listening is passive Meshtastic sniffing (no join, no transmit at
+ *    all): the SX1262 sits in continuous receive, alternating every ~20s
+ *    between two known local Meshtastic channels (Moscow region), and reads
+ *    the plaintext 16-byte packet header of anything it hears - specifically
+ *    the "from" field (a permanent, MAC-derived node number, sent
+ *    unencrypted by design), with no need for the channel's PSK/encryption
+ *    key. Meshtastic itself uses AES to encrypt only the payload past the
+ *    header. Each sighting is logged as M1:<hex node id> or M2:<hex node id>
+ *    depending on which of the two channels it was heard on.
  *
  * Library: LilyGoLib (https://github.com/Xinyuan-LilyGO/LilyGoLib)
  * Board (fqbn): esp32:esp32:tlora_pager
@@ -33,6 +44,32 @@
 #include <WiFi.h>
 #include <SD.h>
 #include <math.h>
+
+// ---------------------------------------------------------------------------
+// Meshtastic passive-listening settings
+// ---------------------------------------------------------------------------
+// These constants are fixed by the Meshtastic protocol itself (same for every
+// channel/region) - NOT something to tune per network:
+#define MESHTASTIC_SYNC_WORD    0x2B
+#define MESHTASTIC_PREAMBLE_LEN 16
+
+// Two known local channels (Moscow region), switched between periodically since
+// one SX1262 can only listen to one frequency/SF/BW combination at a time.
+struct MeshtasticChannel {
+    const char *tag;    // short label used as the id prefix in the log
+    float freqMHz;
+    float bandwidthKHz;
+    uint8_t spreadingFactor;
+    uint8_t codingRate;  // denominator only, e.g. 7 means 4/7
+};
+static const MeshtasticChannel MESHTASTIC_CHANNELS[] = {
+    { "M1", 868.731018, 62.5, 7, 7 },  // user-provided: custom channel, 62.5kHz/SF7/CR4:7
+    { "M2", 869.075,    250.0, 9, 5 }, // MEDIUM_FAST preset, frequency overridden to slot 2
+};
+#define MESHTASTIC_CHANNEL_COUNT 2
+#define MESHTASTIC_CHANNEL_SWITCH_MS 20000UL // how often to hop to the other channel
+
+#define MAX_LORA_ENTRIES_PER_WRITE 8 // cap how many distinct sightings we log per 30s window
 
 // ---------------------------------------------------------------------------
 // Settings
@@ -79,6 +116,16 @@ unsigned long sessionLinesWritten = 0;
 unsigned long sessionWifiScansTotal = 0;   // total networks scanned this session
 int lastWifiCount = 0;                     // networks seen in the last completed scan
 String lastWifiSSIDs = "";                 // "ssid1,ssid2,ssid3" from the last scan
+
+// LoRa: distinct sightings collected since the last log write (reset every WRITE_INTERVAL_MS)
+#define MAX_LORA_BUFFER 16
+String loraBufferIds[MAX_LORA_BUFFER];     // e.g. "A:26D1FA3B" or "J:0004A30B001A2BFE"
+int loraBufferRssi[MAX_LORA_BUFFER];
+int loraBufferCount = 0;
+unsigned long sessionLoraSightingsTotal = 0;
+volatile bool loraPacketReady = false;
+int currentMeshtasticChannelIdx = 0;
+unsigned long lastChannelSwitchMs = 0;
 
 unsigned long lastDisplayUpdate = 0;
 unsigned long lastWifiScanStart = 0;
@@ -224,7 +271,7 @@ static bool openNewLogFile() {
 }
 
 // Writes one line to the current file every 30 sec, always - even with no GPS fix.
-// Format: HH:MM:SS_lat_lon_status_speed_ssid1|bssid1|rssi1,ssid2|bssid2|rssi2,...
+// Format: HH:MM:SS_lat_lon_status_speed_ssid1|bssid1|rssi1,ssid2|bssid2|rssi2,..._M1:node1|rssi1,...
 // status is "ok" when the GPS fix is valid, "bad_gps" otherwise (no fix / not enough satellites).
 // speed is km/h (average of the last 5 fixes), or "NA" if not enough data yet.
 static void writeLogLine() {
@@ -243,22 +290,26 @@ static void writeLogLine() {
     if (speed < 0) strcpy(speedStr, "NA");
     else snprintf(speedStr, sizeof(speedStr), "%.1f", speed);
 
+    String loraStr = flushLoraBufferToString();
+
     bool fixOk = instance.gps.location.isValid() &&
                  instance.gps.satellites.isValid() &&
                  instance.gps.satellites.value() >= MIN_SATS_FOR_FIX;
 
     if (fixOk) {
-        currentLogFile.printf("%s_%.6f_%.6f_ok_%s_%s\n",
+        currentLogFile.printf("%s_%.6f_%.6f_ok_%s_%s_%s\n",
                               timeStr,
                               instance.gps.location.lat(),
                               instance.gps.location.lng(),
                               speedStr,
-                              lastWifiSSIDs.c_str());
+                              lastWifiSSIDs.c_str(),
+                              loraStr.c_str());
     } else {
-        currentLogFile.printf("%s_0.000000_0.000000_bad_gps_%s_%s\n",
+        currentLogFile.printf("%s_0.000000_0.000000_bad_gps_%s_%s_%s\n",
                               timeStr,
                               speedStr,
-                              lastWifiSSIDs.c_str());
+                              lastWifiSSIDs.c_str(),
+                              loraStr.c_str());
     }
     currentLogFile.flush();
     sessionLinesWritten++;
@@ -308,8 +359,108 @@ static void handleWifiScan() {
 }
 
 // ---------------------------------------------------------------------------
-// Track on the canvas (red on black)
+// Meshtastic passive listening (no join, no transmit - just receive + parse header)
 // ---------------------------------------------------------------------------
+// Called from radio interrupt context - keep it minimal, just set a flag.
+IRAM_ATTR void onLoraPacket() {
+    loraPacketReady = true;
+}
+
+// Applies one of the two known channel configs and (re)starts continuous receive.
+static bool tuneToMeshtasticChannel(int idx) {
+    const MeshtasticChannel &ch = MESHTASTIC_CHANNELS[idx];
+    int state = radio.begin(ch.freqMHz, ch.bandwidthKHz, ch.spreadingFactor,
+                             ch.codingRate, MESHTASTIC_SYNC_WORD, 10, MESHTASTIC_PREAMBLE_LEN);
+    if (state != RADIOLIB_ERR_NONE) {
+        Serial.printf("Meshtastic listener: failed to tune to %s (%.6f MHz), code %d\n",
+                      ch.tag, ch.freqMHz, state);
+        return false;
+    }
+    radio.setDio1Action(onLoraPacket);
+    radio.startReceive();
+    return true;
+}
+
+static bool setupLoraListener() {
+    lastChannelSwitchMs = millis();
+    return tuneToMeshtasticChannel(currentMeshtasticChannelIdx);
+}
+
+// Adds one sighting to the buffer that will be flushed into the next log line.
+// Skips duplicates of an id already buffered in this window (keeps the
+// strongest RSSI seen for it instead).
+static void bufferLoraSighting(const String &id, int rssi) {
+    for (int i = 0; i < loraBufferCount; i++) {
+        if (loraBufferIds[i] == id) {
+            if (rssi > loraBufferRssi[i]) loraBufferRssi[i] = rssi;
+            return;
+        }
+    }
+    if (loraBufferCount < MAX_LORA_BUFFER) {
+        loraBufferIds[loraBufferCount] = id;
+        loraBufferRssi[loraBufferCount] = rssi;
+        loraBufferCount++;
+    }
+    sessionLoraSightingsTotal++;
+}
+
+// Parses the plaintext Meshtastic packet header (16 bytes, never encrypted):
+// to(4) + from(4) + packet_id(4) + flags(1) + channel_hash(1) + next_hop(1) + relay_node(1)
+// We only need "from" - the sender's node number, derived from its Bluetooth
+// MAC address and therefore permanent for that physical device. No decryption
+// of the payload is needed or attempted.
+static void parseMeshtasticFrame(uint8_t *data, size_t len, int rssi, int channelIdx) {
+    if (len < 8) return; // too short to even contain to+from
+
+    char nodeId[9];
+    // "from" is bytes[4..7], little-endian on the wire -> print MSB first
+    snprintf(nodeId, sizeof(nodeId), "%02X%02X%02X%02X", data[7], data[6], data[5], data[4]);
+
+    String id = String(MESHTASTIC_CHANNELS[channelIdx].tag) + ":" + String(nodeId);
+    bufferLoraSighting(id, rssi);
+}
+
+static void handleLoraRx() {
+    // Hop to the other known channel periodically so we get a share of both.
+    unsigned long now = millis();
+    if (now - lastChannelSwitchMs >= MESHTASTIC_CHANNEL_SWITCH_MS) {
+        currentMeshtasticChannelIdx = (currentMeshtasticChannelIdx + 1) % MESHTASTIC_CHANNEL_COUNT;
+        tuneToMeshtasticChannel(currentMeshtasticChannelIdx);
+        lastChannelSwitchMs = now;
+        return; // give the new config a full cycle before reading anything
+    }
+
+    if (!loraPacketReady) return;
+    loraPacketReady = false;
+
+    uint8_t buf[64];
+    size_t len = radio.getPacketLength();
+    if (len > 0 && len <= sizeof(buf)) {
+        int state = radio.readData(buf, len);
+        if (state == RADIOLIB_ERR_NONE) {
+            int rssi = (int)radio.getRSSI();
+            parseMeshtasticFrame(buf, len, rssi, currentMeshtasticChannelIdx);
+        }
+    }
+    radio.startReceive(); // resume listening
+}
+
+// Builds the "M1:node1|rssi1,M2:node2|rssi2,..." string for the current buffer,
+// then clears the buffer for the next collection window.
+static String flushLoraBufferToString() {
+    String out = "";
+    int n = min(loraBufferCount, MAX_LORA_ENTRIES_PER_WRITE);
+    for (int i = 0; i < n; i++) {
+        if (i > 0) out += ",";
+        out += loraBufferIds[i];
+        out += "|";
+        out += String(loraBufferRssi[i]);
+    }
+    loraBufferCount = 0;
+    return out;
+}
+
+
 static void mapLatLonToCanvas(float lat, float lon, int32_t &x, int32_t &y) {
     float spanLat = (maxLat - minLat);
     float spanLon = (maxLon - minLon);
@@ -495,19 +646,19 @@ static void updateRecScreen() {
         lv_label_set_text_fmt(recTableLabel,
             "RECORDING   Sat:%d   Lat:%.6f Lon:%.6f\n"
             "WiFi visible:%d   Speed:%s   File:%lu KB\n"
-            "Lines written:%lu   WiFi scanned (total):%lu",
+            "Lines written:%lu   WiFi scanned (total):%lu   LoRa sighted (total):%lu",
             instance.gps.satellites.isValid() ? instance.gps.satellites.value() : 0,
             instance.gps.location.lat(), instance.gps.location.lng(),
             lastWifiCount, speedStr, fileSizeKb,
-            sessionLinesWritten, sessionWifiScansTotal);
+            sessionLinesWritten, sessionWifiScansTotal, sessionLoraSightingsTotal);
     } else {
         lv_label_set_text_fmt(recTableLabel,
             "RECORDING   Sat:%d   Lat:--.------ Lon:--.------ (waiting for fix)\n"
             "WiFi visible:%d   Speed:%s   File:%lu KB\n"
-            "Lines written:%lu   WiFi scanned (total):%lu",
+            "Lines written:%lu   WiFi scanned (total):%lu   LoRa sighted (total):%lu",
             instance.gps.satellites.isValid() ? instance.gps.satellites.value() : 0,
             lastWifiCount, speedStr, fileSizeKb,
-            sessionLinesWritten, sessionWifiScansTotal);
+            sessionLinesWritten, sessionWifiScansTotal, sessionLoraSightingsTotal);
     }
 }
 
@@ -518,6 +669,8 @@ static void startRecording() {
     if (!sdReady) return; // no SD card -> do not start recording
     sessionLinesWritten = 0;
     sessionWifiScansTotal = 0;
+    sessionLoraSightingsTotal = 0;
+    loraBufferCount = 0;
     resetTrack();
     speedBufCount = 0;
     speedBufHead = 0;
@@ -625,6 +778,11 @@ void setup() {
     WiFi.mode(WIFI_STA);
     WiFi.disconnect();
 
+    // LoRa - passive Meshtastic listening only (no join, no transmit)
+    if (!setupLoraListener()) {
+        Serial.println("Meshtastic listener init failed - continuing without it.");
+    }
+
     appState = APP_IDLE;
 }
 
@@ -638,6 +796,7 @@ void loop() {
 
     handleKeyboard();
     handleWifiScan();
+    handleLoraRx();
 
     if (appState == APP_RECORDING) {
         handleRecording();
