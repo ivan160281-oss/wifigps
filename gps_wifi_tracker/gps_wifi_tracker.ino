@@ -367,17 +367,57 @@ IRAM_ATTR void onLoraPacket() {
 }
 
 // Applies one of the two known channel configs and (re)starts continuous receive.
+// Uses individual RadioLib setters on the ALREADY-initialized radio object
+// (set up once by instance.begin()) instead of calling radio.begin() again -
+// a fresh begin() risks resetting board-specific low-level config (TCXO
+// voltage, regulator mode) that only instance.begin() knows how to set
+// correctly for this exact hardware, which could silently break receive
+// sensitivity entirely.
 static bool tuneToMeshtasticChannel(int idx) {
     const MeshtasticChannel &ch = MESHTASTIC_CHANNELS[idx];
-    int state = radio.begin(ch.freqMHz, ch.bandwidthKHz, ch.spreadingFactor,
-                             ch.codingRate, MESHTASTIC_SYNC_WORD, 10, MESHTASTIC_PREAMBLE_LEN);
+    int state;
+
+    radio.standby();
+
+    state = radio.setFrequency(ch.freqMHz);
     if (state != RADIOLIB_ERR_NONE) {
-        Serial.printf("Meshtastic listener: failed to tune to %s (%.6f MHz), code %d\n",
-                      ch.tag, ch.freqMHz, state);
+        Serial.printf("Meshtastic listener: setFrequency(%s) failed, code %d\n", ch.tag, state);
         return false;
     }
+    state = radio.setBandwidth(ch.bandwidthKHz);
+    if (state != RADIOLIB_ERR_NONE) {
+        Serial.printf("Meshtastic listener: setBandwidth(%s) failed, code %d\n", ch.tag, state);
+        return false;
+    }
+    state = radio.setSpreadingFactor(ch.spreadingFactor);
+    if (state != RADIOLIB_ERR_NONE) {
+        Serial.printf("Meshtastic listener: setSpreadingFactor(%s) failed, code %d\n", ch.tag, state);
+        return false;
+    }
+    state = radio.setCodingRate(ch.codingRate);
+    if (state != RADIOLIB_ERR_NONE) {
+        Serial.printf("Meshtastic listener: setCodingRate(%s) failed, code %d\n", ch.tag, state);
+        return false;
+    }
+    state = radio.setSyncWord(MESHTASTIC_SYNC_WORD);
+    if (state != RADIOLIB_ERR_NONE) {
+        Serial.printf("Meshtastic listener: setSyncWord(%s) failed, code %d\n", ch.tag, state);
+        return false;
+    }
+    state = radio.setPreambleLength(MESHTASTIC_PREAMBLE_LEN);
+    if (state != RADIOLIB_ERR_NONE) {
+        Serial.printf("Meshtastic listener: setPreambleLength(%s) failed, code %d\n", ch.tag, state);
+        return false;
+    }
+
     radio.setDio1Action(onLoraPacket);
-    radio.startReceive();
+    state = radio.startReceive();
+    if (state != RADIOLIB_ERR_NONE) {
+        Serial.printf("Meshtastic listener: startReceive(%s) failed, code %d\n", ch.tag, state);
+        return false;
+    }
+
+    Serial.printf("Meshtastic listener: tuned to %s (%.6f MHz)\n", ch.tag, ch.freqMHz);
     return true;
 }
 
@@ -417,6 +457,7 @@ static void parseMeshtasticFrame(uint8_t *data, size_t len, int rssi, int channe
     snprintf(nodeId, sizeof(nodeId), "%02X%02X%02X%02X", data[7], data[6], data[5], data[4]);
 
     String id = String(MESHTASTIC_CHANNELS[channelIdx].tag) + ":" + String(nodeId);
+    Serial.printf("Meshtastic: heard %s, rssi=%d dBm, len=%u\n", id.c_str(), rssi, (unsigned)len);
     bufferLoraSighting(id, rssi);
 }
 

@@ -56,6 +56,18 @@ coordinates, so (exactly like WiFi) any positioning value has to come from your 
 accumulated observations over time. If you know of more local channels in use, add
 them to the `MESHTASTIC_CHANNELS` array near the top of the sketch.
 
+**If `LoRa sighted (total)` stays at 0:** open a serial monitor at 115200 baud right
+after boot. Every ~20 seconds you should see a line like
+`Meshtastic listener: tuned to M1 (868.731018 MHz)` confirming the channel switch
+succeeded (if it fails, the reason/error code is printed instead). When an actual
+packet is heard, you'll see `Meshtastic: heard M1:A1B2C3D4, rssi=-88 dBm, len=23` -
+if you see plenty of these but the on-device counter/log file still shows nothing,
+that's a different bug (please report it); if you see neither, it's most likely
+that there's simply no local Meshtastic traffic on the given channel/frequency at
+that moment and place - Meshtastic nodes often only beacon their position every
+several minutes, so give it a few minutes in a spot with likely coverage before
+concluding there's nothing to hear.
+
 **WiFi scanning** is asynchronous, every 15 sec, never blocks GPS or the display.
 
 File: `gps_wifi_tracker/gps_wifi_tracker.ino`
