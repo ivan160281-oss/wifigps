@@ -957,6 +957,8 @@ static void handleKeyboard() {
 // Recording logic: write a line every 30 sec + rotate the file every 30 min
 // ---------------------------------------------------------------------------
 static void handleRecording() {
+    instance.gps.loop();
+
     bool wasFix = hadGpsFix;
     bool fixOk = instance.gps.location.isValid() &&
                  instance.gps.satellites.isValid() &&
