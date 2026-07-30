@@ -1,36 +1,43 @@
-# GPS + WiFi tracker for LILYGO T-LoRa Pager
+# GPS + WiFi + Meshtastic tracker for LILYGO T-LoRa Pager
 
 ## How it works
 
-**Idle screen (not recording):**
-- GPS status (searching / fix acquired, satellite count)
-- WiFi status (ready, how many networks are visible right now)
-- current time UTC+3 (from GPS)
-- hint: `ENTER - start recording` (uses the T-LoRa Pager's built-in keyboard)
+**Recording** (background state, independent of what's on screen):
+- **ENTER** - start recording (needs an SD card)
+- **ENTER** again - stop recording (file is flushed and closed)
+- **E** (any time except when already stopped) - full stop: file is closed,
+  screen shows "Application stopped", device does nothing further (reboot
+  required to run again)
 
-**ENTER** on the idle screen -> starts recording.
-**ENTER** while recording -> stops recording (file is flushed and closed), back to idle screen.
-**E** (any time except when already stopped) -> full stop: file is closed, screen shows
-"Application stopped", device does nothing further (reboot required to run again).
-**S** (from idle or while recording) -> on-device self-diagnostics screen (see below).
-Press **S** or **ENTER** again to return to whatever screen you were on before.
+**Display modes** - **S** cycles between three screens (recording, if active,
+keeps running in the background regardless of which screen is shown):
 
-**Self-diagnostics screen (no USB/serial monitor needed):**
-- GPS: fix status, satellite count, raw NMEA counters (characters processed,
-  sentences with a fix, failed checksums - useful to confirm the GPS module is
-  actually talking at all), lat/lon/altitude/speed/HDOP
-- WiFi: how many networks in the last scan, plus up to 4 of them with their RSSI
-- Meshtastic: which of the two known channels is currently tuned, total sightings
-  heard since boot, and the last node heard (id, RSSI, how many seconds ago)
-- SD card status, free heap, free PSRAM
-- If a recording session is active, it keeps running in the background (file
-  writes and track drawing continue) while you're looking at this screen
+1. **Track** - red track on a black background (bottom part of the screen) +
+   status line: recording/idle, satellite count, coordinates, **track length
+   in km**, speed, lines written
+2. **Diagnostics** - full-screen, scrollable text (use the **rotary
+   scroll wheel** on the side of the device to scroll up/down): raw GPS stats
+   (characters processed, sentences with a fix, failed checksums, lat/lon/alt/
+   speed/HDOP), last WiFi scan (up to 4 networks with RSSI), Meshtastic status
+   (current channel, total heard since boot, last node heard + RSSI + seconds
+   ago), SD card status, free heap/PSRAM
+3. **Grid** - screen split into 4 cells, one per module (GPS / WiFi /
+   Meshtastic / SD), colored **green** when everything looks fine and data is
+   coming in, **red** when there's a problem (no fix, no networks seen, no
+   recent Meshtastic activity, SD not found)
 
-**While recording, on screen:**
-- red track on a black background (bottom part of the screen)
-- table: satellite count, coordinates, visible WiFi count, speed (average of the last
-  5 points, km/h), current file size in KB
-- counters: lines written this session, total networks scanned this session
+A **battery percentage** badge is shown in the top-right corner on every
+screen (turns red at 15% or below).
+
+**Buzzer feedback** (via the onboard ES8311 codec + speaker):
+- **5 beeps** whenever a Meshtastic sighting is heard
+- **1 long beep** the moment GPS acquires a fix (searching -> fix transition)
+- **1 short beep every 40 seconds** while the battery is at 15% or below (and
+  not charging)
+
+Note: beeping briefly blocks the main loop (the longest pattern, 5 Meshtastic
+beeps, takes ~1 second) - this is a deliberate simplicity/responsiveness
+trade-off given how infrequently these events actually happen.
 
 **On the SD card:**
 - `/WIFIGPS` folder at the root of the SD card
@@ -48,7 +55,7 @@ Press **S** or **ENTER** again to return to whatever screen you were on before.
     `node_id` is the sender's permanent, MAC-derived Meshtastic node number
   - nothing sits between the surrounding `_` separators if a list is empty
 - the red track and the speed calculation still only use points with a valid fix -
-  `bad_gps` rows don't affect the drawn track
+  `bad_gps` rows don't affect the drawn track or the track length
 
 **About the Meshtastic field (passive listening, no network join, no transmit):**
 [Meshtastic](https://meshtastic.org/) is an open mesh-messaging protocol run over LoRa
@@ -69,21 +76,13 @@ coordinates, so (exactly like WiFi) any positioning value has to come from your 
 accumulated observations over time. If you know of more local channels in use, add
 them to the `MESHTASTIC_CHANNELS` array near the top of the sketch.
 
-**If `LoRa sighted (total)` stays at 0:** open a serial monitor at 115200 baud right
+**If Meshtastic sightings stay at 0:** open a serial monitor at 115200 baud right
 after boot. Every ~20 seconds you should see a line like
 `Meshtastic listener: tuned to M1 (868.731018 MHz)` confirming the channel switch
-succeeded (if it fails, the reason/error code is printed instead). When an actual
-packet is heard, you'll see `Meshtastic: heard M1:A1B2C3D4, rssi=-88 dBm, len=23` -
-if you see plenty of these but the on-device counter/log file still shows nothing,
-that's a different bug (please report it); if you see neither, it's most likely
-that there's simply no local Meshtastic traffic on the given channel/frequency at
-that moment and place - Meshtastic nodes often only beacon their position every
-several minutes, so give it a few minutes in a spot with likely coverage before
-concluding there's nothing to hear.
-
-**WiFi scanning** is asynchronous, every 15 sec, never blocks GPS or the display.
-
-File: `gps_wifi_tracker/gps_wifi_tracker.ino`
+succeeded. When an actual packet is heard, you'll see
+`Meshtastic: heard M1:A1B2C3D4, rssi=-88 dBm, len=23`. If you see neither, it's most
+likely that there's simply no local Meshtastic traffic on the given channel/frequency
+at that moment and place - give it a few minutes in a spot with likely coverage.
 
 ## Getting a .bin without installing anything locally
 
@@ -110,16 +109,16 @@ core 3.3.10.
 - GPS is already built into the library as `instance.gps` (extends TinyGPSPlus); the UART
   is configured automatically inside `instance.begin()` at 38400 baud
 - Keyboard: `instance.kb.getKey(&c)` - the board's physical QWERTY keyboard
-- SD card is mounted by the library at `/sd` via `instance.installSD()`
+- Rotary/scroll wheel: `instance.getRotary()` / `instance.clearRotaryMsg()` -
+  enabled once via `instance.enableRotary()`
+- Battery: read via `instance.ppm.getBattVoltage()` (BQ25896 charger IC - voltage
+  only, no fuel gauge, so the percentage shown is a standard LiPo discharge-curve
+  approximation, not a precisely calibrated reading)
+- Speaker: `instance.codec` (ES8311 codec) - `instance.powerControl(POWER_SPEAK, true)`
+  to turn on audio power (off by default), then `codec.open()`/`codec.write()` to
+  play raw PCM sine-wave tones (see `examples/peripheral/SimpleTone` in LilyGoLib)
+- SD card is mounted by the library at `/sd` via `instance.installSD()`, but paths
+  passed to the `SD` object itself must NOT include the `/sd` prefix (the library
+  already implies it)
 - The screen is drawn with LVGL (v9); the track uses `lv_canvas` with direct line drawing
 - Minimum satellites for a valid fix is 3 (`MIN_SATS_FOR_FIX`, adjust if needed)
-
-## If the screen stays black after flashing
-
-This can happen for reasons unrelated to the sketch logic itself. A few things worth
-checking on real hardware:
-- Confirm the `.bin` was flashed at the correct offset (`0x0` for the merged binary)
-- Open a serial monitor (115200 baud) right after reset - `Serial.begin(115200)` runs
-  first in `setup()`, so any early crash/reboot loop should be visible there
-- Make sure the board didn't silently reset into download/bootloader mode - try a full
-  power cycle (unplug USB) rather than just pressing reset
