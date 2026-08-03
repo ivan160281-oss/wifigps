@@ -2,43 +2,74 @@
  * GPS + WiFi + Meshtastic tracker for LILYGO T-LoRa Pager (ESP32-S3, LilyGoLib)
  * -----------------------------------------------------------------------------
  * Recording (background state, independent of what's on screen):
- *  - ENTER - start recording (requires SD card)
- *  - ENTER again - stop recording (file is flushed and closed)
+ *  - Starts automatically ~60s after boot (gives GPS/sensors a moment to come up)
+ *  - ENTER toggles it off/back on manually at any time
  *  - "E" - full exit: recording stops, file is closed, device shows a
  *    "stopped" screen and does nothing further (reboot required)
+ *  - "U" (idle only, i.e. not while recording) - WiFi sync: connects to the
+ *    WiFi network configured in /WIFIGPS/sync_config.txt on the SD card
+ *    (simple ssid=/password=/server_url=/sync_password= text file, edited on
+ *    a computer), asks the server which log files it doesn't have yet, and
+ *    uploads only those. Each file is deleted from the SD card right after a
+ *    confirmed-successful upload (the main way SD space gets freed - see the
+ *    circular buffer note below for the fallback). sync_password must match
+ *    the server's WIFIGPS_PASSWORD (sent as a request header, since the
+ *    device can't do a browser login). Fully blocking with an on-screen
+ *    progress/result message; press any key to dismiss the result and
+ *    return to normal.
  *
- * Display modes ("S" cycles: Track -> Diagnostics -> Grid -> Track ...):
- *  1. Track: red track on black + track length (km) + status/coords/battery
- *  2. Diagnostics: full-screen, scrollable (rotary encoder up/down) - GPS raw
- *     stats, WiFi list, Meshtastic status, SD, memory, battery
- *  3. Grid: one cell per module (GPS / WiFi / Meshtastic / SD), green if OK,
- *     red if there's a problem/no data, + battery
+ * Single-screen display: red track on black, plus a header with:
+ *  - top-right: battery percentage
+ *  - top-left: recording indicator (filled red ball while recording, hollow
+ *    grey while idle) + how many lines have been written this session
+ *  - three colored count chips, same colors as the server's map: WiFi
+ *    (blue, last scan's network count), BLE (green, last scan's device
+ *    count), Meshtastic (purple, total sightings heard since boot - a count,
+ *    not a "last heard" time)
+ *  - status line: sat count, coordinates, track length (km), speed
  *
- * A battery percentage indicator is shown on every screen (top-right corner).
+ * Battery-saving screen sleep: while running on battery (not charging), the
+ * display turns off automatically after 3 minutes with no key presses.
+ * Press SPACE to wake it back up (any other key is ignored while asleep, so
+ * a stray press in a pocket doesn't accidentally do something). GPS
+ * recording, WiFi/BLE/Meshtastic scanning all keep running while the screen
+ * is off.
  *
  * Buzzer (via the onboard ES8311 codec + speaker):
- *  - 5 long beeps whenever a Meshtastic sighting is heard
- *  - 1 long beep when GPS acquires a fix (on the searching -> fix transition)
+ *  - 1 short LOW beep when GPS satellites are found (searching -> fix)
+ *  - 3 short HIGH beeps when GPS satellites are lost (fix -> searching)
  *  - 1 short beep every 40s while the battery is low
  *
  * SD card: /WIFIGPS folder at the SD root, file log_YYYYMMDD_HHMMSS.txt (new
- * file every 30 minutes of recording). One line written every 30 seconds,
- * ALWAYS (even with no GPS fix):
- *   HH:MM:SS_lat_lon_status_speed_ssid1|bssid1|rssi1,..._M1:node1|rssi1,...
+ * file every 30 minutes of recording; total data kept on the SD card is
+ * capped at SD_LOG_BUDGET_BYTES (10 MB) via a circular buffer - see
+ * pruneOldLogsIfOverBudget()). One line written every 30 seconds, ALWAYS
+ * (even with no GPS fix):
+ *   HH:MM:SS_lat_lon_status_speed_ssid1|bssid1|rssi1,..._M1:node1|rssi1,..._mac1|rssi1,..._heading_steps
  * status is "ok" or "bad_gps" (lat/lon are 0.000000 for bad_gps). speed is
  * km/h (average of the last 5 fixes) or "NA". Each WiFi network is logged as
  * ssid|bssid|rssi. Each Meshtastic sighting is logged as
  * <channel_tag>:<node_id_hex>|rssi (node_id is the sender's permanent,
  * MAC-derived Meshtastic node number, read from the packet's plaintext
- * header - no decryption needed or performed). Empty lists leave nothing
- * between their surrounding "_" separators.
+ * header - no decryption needed or performed). Each BLE sighting is logged as
+ * <mac>|rssi (passive scan - no pairing/connecting; many phones/wearables
+ * rotate their BLE address for privacy, so only genuinely fixed devices
+ * build up repeat sightings over time). heading is the BHI260AP sensor hub's
+ * fused compass heading in degrees, steps is its cumulative hardware step
+ * counter (both "NA" if the sensor isn't present) - raw data only, any dead-
+ * reckoning math is done server-side. Empty lists leave nothing between
+ * their surrounding "_" separators.
  *
- * WiFi scanning is asynchronous and never blocks GPS/display. Meshtastic
- * listening is passive (no join, no transmit at all): the SX1262 alternates
- * every ~20s between two known local channels and reads the plaintext header
- * of anything it hears. Since a single radio can only listen to one channel
- * at a time, this only ever catches a share of local traffic - a best-effort
- * supplementary data source, not an exhaustive scanner.
+ * WiFi scanning is asynchronous and never blocks GPS/display. BLE scanning
+ * uses the classic (blocking) Arduino BLE API, so it's broken into several
+ * short chunks with a keyboard check in between (rather than one long
+ * uninterrupted block) to keep the device responsive to key presses.
+ * Meshtastic listening is passive (no join, no transmit at all): the SX1262
+ * alternates every ~20s between two known local channels and reads the
+ * plaintext header of anything it hears. Since a single radio can only
+ * listen to one channel at a time, this only ever catches a share of local
+ * traffic - a best-effort supplementary data source, not an exhaustive
+ * scanner.
  *
  * Library: LilyGoLib (https://github.com/Xinyuan-LilyGO/LilyGoLib)
  * Board (fqbn): esp32:esp32:tlora_pager
@@ -49,6 +80,11 @@
 #include <WiFi.h>
 #include <SD.h>
 #include <math.h>
+#include <HTTPClient.h>
+#include <BLEDevice.h>
+#include <BLEScan.h>
+#include <BLEAdvertisedDevice.h>
+#include <bosch/BoschSensorDataHelper.hpp>
 
 // ---------------------------------------------------------------------------
 // Meshtastic passive-listening settings
@@ -70,12 +106,16 @@ static const MeshtasticChannel MESHTASTIC_CHANNELS[] = {
 #define MESHTASTIC_CHANNEL_COUNT 2
 #define MESHTASTIC_CHANNEL_SWITCH_MS 20000UL
 #define MAX_LORA_ENTRIES_PER_WRITE 8
-#define MESHTASTIC_STALE_MS (5UL * 60UL * 1000UL) // "no recent activity" threshold for the grid view
 
 // ---------------------------------------------------------------------------
 // General settings
 // ---------------------------------------------------------------------------
 #define WIFI_SCAN_INTERVAL_MS   15000UL
+#define BLE_SCAN_INTERVAL_MS    25000UL
+#define BLE_SCAN_CHUNK_SEC      1        // BLEScan::start() only accepts whole seconds
+#define BLE_SCAN_CHUNKS         2        // 2x 1s chunks (same total budget as before), with a
+                                          // keyboard check in between so a key press is never
+                                          // stuck behind more than ~1s of BLE scanning
 #define WRITE_INTERVAL_MS       30000UL
 #define FILE_ROTATE_MS          (30UL * 60UL * 1000UL)
 #define DISPLAY_UPDATE_MS       500UL
@@ -87,21 +127,44 @@ static const MeshtasticChannel MESHTASTIC_CHANNELS[] = {
 #define LOW_BATTERY_BEEP_MS     40000UL
 
 #define SD_ROOT "/WIFIGPS"
+#define SD_LOG_BUDGET_BYTES (10UL * 1024UL * 1024UL) // circular buffer cap - oldest files get pruned past this
+#define MAX_SD_FILES_TRACKED 200
+
+#define AUTO_RECORD_START_MS   (60UL * 1000UL)   // auto-start recording ~60s after boot
+#define SCREEN_SLEEP_TIMEOUT_MS (3UL * 60UL * 1000UL) // screen off after 3 min idle, battery power only
+
+// ---------------------------------------------------------------------------
+// WiFi sync settings (automatic upload of logs not yet on the server)
+// ---------------------------------------------------------------------------
+// Edited on a computer before inserting the SD card - simple key=value text,
+// one per line, e.g.:
+//   ssid=MyHomeWiFi
+//   password=hunter2
+//   server_url=http://192.168.1.50:5000
+#define SYNC_CONFIG_PATH        "/WIFIGPS/sync_config.txt"
+#define WIFI_CONNECT_TIMEOUT_MS 15000UL
+#define HTTP_TIMEOUT_MS         15000UL
 
 #define SCR_W      480
 #define SCR_H      222
-#define HEADER_H   96
+#define HEADER_H   112
 #define TRACK_H    (SCR_H - HEADER_H)
+#define STATUS_BAR_H 22   // reserved top strip for the battery indicator - nothing else may render here
 
 // ---------------------------------------------------------------------------
 // Application state
 // ---------------------------------------------------------------------------
-enum DisplayMode { MODE_TRACK, MODE_DIAG, MODE_GRID };
-DisplayMode displayMode = MODE_TRACK;
 bool recording = false;
+bool autoRecordTriggered = false; // ensures the ~60s auto-start fires only once
 bool appStopped = false;
+unsigned long bootMs = 0; // set once at the top of setup(), used for the auto-record timer
 
 struct Pt { float lat, lon; uint32_t ts; };
+struct SdFileInfo { String name; size_t size; }; // moved up here - Arduino auto-generates
+                                                  // function prototypes at the top of the file,
+                                                  // so custom struct types used as parameters
+                                                  // must be declared before any function that
+                                                  // uses them, or the prototype generation breaks
 static Pt track[MAX_TRACK_POINTS];
 static int trackCount = 0;
 static bool haveBBox = false;
@@ -120,6 +183,24 @@ unsigned long sessionLinesWritten = 0;
 unsigned long sessionWifiScansTotal = 0;
 int lastWifiCount = 0;
 String lastWifiSSIDs = "";
+
+BLEScan *bleScanner = nullptr;
+unsigned long lastBleScanMs = 0;
+int lastBleCount = 0;
+unsigned long sessionBleScansTotal = 0;
+String lastBleList = "";
+
+// IMU (BHI260AP hardware sensor hub) - heading + step count only. The
+// firmware just logs these raw; any dead-reckoning math (estimating a
+// position from "last known fix + steps + heading" for stretches with no
+// GPS) is left to the server, which already has the infrastructure and
+// compute budget for this kind of estimation.
+bool imuReady = false;
+SensorQuaternion *bhiQuaternion = nullptr;
+SensorStepCounter *bhiStepCounter = nullptr;
+float lastHeadingDeg = -1;   // -1 = no reading yet
+uint32_t lastStepCount = 0;
+bool haveStepCount = false;
 
 #define MAX_LORA_BUFFER 16
 String loraBufferIds[MAX_LORA_BUFFER];
@@ -144,25 +225,44 @@ bool hadGpsFix = false;         // for edge-detecting the "fix acquired" beep
 unsigned long lastLowBattBeepMs = 0;
 bool audioReady = false;
 
-// LVGL objects
+String syncSsid = "";
+String syncPassword = "";
+String syncServerUrl = "";
+String syncApiPassword = "";
+bool syncConfigLoaded = false;
+bool inSyncScreen = false;
+int lastHttpErrorCode = 0; // exact HTTPClient return code from the last failed sync call, for diagnostics
+
+lv_obj_t *syncScreen;
+lv_obj_t *syncLabel;
+
+// LVGL objects - single-screen UI now (Diagnostics/Grid removed)
 lv_obj_t *trackScreen;
 lv_obj_t *trackStatusLabel;
 lv_obj_t *canvas;
 static void *canvasBuf = nullptr;
 
-lv_obj_t *diagScreen;
-lv_obj_t *diagLabel;
-
-lv_obj_t *gridScreen;
-lv_obj_t *gridCellGps, *gridCellWifi, *gridCellLora, *gridCellSd;
-lv_obj_t *gridLabelGps, *gridLabelWifi, *gridLabelLora, *gridLabelSd;
-lv_obj_t *gridBatteryLabel;
-
 lv_obj_t *stoppedScreen;
 
-// Small battery badges added to the track/diag screens (grid has its own gridBatteryLabel)
 lv_obj_t *trackBatteryLabel;
-lv_obj_t *diagBatteryLabel;
+
+// Header widgets: recording indicator (red ball + line count) and the three
+// colored network-count chips (WiFi/BLE/Meshtastic), same colors as the
+// server's map.
+lv_obj_t *recDot;
+lv_obj_t *recCountLabel;
+lv_obj_t *wifiChip, *bleChip, *loraChip;
+lv_obj_t *wifiChipLabel, *bleChipLabel, *loraChipLabel;
+#define COLOR_WIFI_CHIP  lv_color_make(0x4d, 0xa6, 0xff) // matches server map: WiFi = blue
+#define COLOR_BLE_CHIP   lv_color_make(0x3d, 0xdc, 0x97) // matches server map: BLE = green
+#define COLOR_LORA_CHIP  lv_color_make(0xa8, 0x6e, 0xe8) // matches server map: Meshtastic = purple
+
+// Screen sleep (battery saving): tracks the last key activity; if running on
+// battery (not charging) and idle past SCREEN_SLEEP_TIMEOUT_MS, the display
+// turns off. SPACE wakes it back up; every other key is ignored while
+// asleep. Everything else (GPS/recording/scanning) keeps running regardless.
+bool screenAsleep = false;
+unsigned long lastKeyActivityMs = 0;
 
 // ---------------------------------------------------------------------------
 // Time: unix timestamp <-> date/time (UTC), Howard Hinnant's algorithm
@@ -287,9 +387,9 @@ static void beepPattern(int count, int toneMs, int gapMs, int freqHz = 1200) {
     }
 }
 
-static void beepMeshtasticFound()  { beepPattern(5, 120, 90, 1400); }   // 5 long-ish beeps
-static void beepGpsFixAcquired()   { beepPattern(1, 350, 0, 1000); }    // 1 long beep
-static void beepLowBattery()       { beepPattern(1, 90, 0, 700); }      // 1 short beep
+static void beepGpsFixAcquired()   { beepPattern(1, 100, 0, 700); }       // 1 short LOW beep
+static void beepGpsFixLost()       { beepPattern(3, 60, 60, 1800); }      // 3 short HIGH beeps
+static void beepLowBattery()       { beepPattern(1, 90, 0, 700); }        // 1 short beep
 
 // ---------------------------------------------------------------------------
 // Speed: haversine distance between consecutive points, averaged over last N
@@ -340,9 +440,83 @@ static void closeCurrentFile() {
     }
 }
 
+
+// Lists every .txt file directly inside SD_ROOT along with its size.
+static int listSdTxtFilesWithSize(SdFileInfo *out, int maxCount) {
+    int count = 0;
+    File dir = SD.open(SD_ROOT);
+    if (!dir) return 0;
+    File entry = dir.openNextFile();
+    while (entry && count < maxCount) {
+        if (!entry.isDirectory()) {
+            String name = String(entry.name());
+            int slash = name.lastIndexOf('/');
+            if (slash >= 0) name = name.substring(slash + 1);
+            if (name.endsWith(".txt")) {
+                out[count].name = name;
+                out[count].size = entry.size();
+                count++;
+            }
+        }
+        entry.close();
+        entry = dir.openNextFile();
+    }
+    dir.close();
+    return count;
+}
+
+// Simple insertion sort by filename - since files are named
+// log_YYYYMMDD_HHMMSS.txt, sorting the name ascending is the same as sorting
+// chronologically (oldest first). Fine for the modest file counts expected here.
+static void sortFilesByNameAscending(SdFileInfo *arr, int n) {
+    for (int i = 1; i < n; i++) {
+        SdFileInfo key = arr[i];
+        int j = i - 1;
+        while (j >= 0 && arr[j].name > key.name) {
+            arr[j + 1] = arr[j];
+            j--;
+        }
+        arr[j + 1] = key;
+    }
+}
+
+// Circular buffer: keeps total log data on the SD card under SD_LOG_BUDGET_BYTES
+// by deleting the OLDEST files first. Called right before starting a new log
+// file, after the previous one has already been closed (never touches a file
+// that's still open for writing). This is a last-resort safety net for when
+// WiFi sync hasn't run in a while - the normal, safe way files get freed is
+// still "uploaded successfully, then deleted" in runWifiSync().
+static void pruneOldLogsIfOverBudget() {
+    if (!sdReady) return;
+    static SdFileInfo files[MAX_SD_FILES_TRACKED];
+    int n = listSdTxtFilesWithSize(files, MAX_SD_FILES_TRACKED);
+    if (n == 0) return;
+
+    size_t total = 0;
+    for (int i = 0; i < n; i++) total += files[i].size;
+    if (total <= SD_LOG_BUDGET_BYTES) return;
+
+    sortFilesByNameAscending(files, n);
+
+    int i = 0;
+    while (total > SD_LOG_BUDGET_BYTES && i < n) {
+        char path[96];
+        snprintf(path, sizeof(path), "%s/%s", SD_ROOT, files[i].name.c_str());
+        if (SD.remove(path)) {
+            total -= files[i].size;
+            Serial.printf("Circular buffer: removed %s to stay under %luMB\n",
+                          files[i].name.c_str(), SD_LOG_BUDGET_BYTES / (1024UL * 1024UL));
+        }
+        i++;
+    }
+}
+
 static bool openNewLogFile() {
     if (!sdReady) return false;
     if (!SD.exists(SD_ROOT)) SD.mkdir(SD_ROOT);
+
+    closeCurrentFile();
+    pruneOldLogsIfOverBudget();
 
     int y, mo, d, h, mi, s;
     char path[96];
@@ -353,7 +527,6 @@ static bool openNewLogFile() {
         snprintf(path, sizeof(path), "%s/log_uptime_%lu.txt", SD_ROOT, millis() / 1000UL);
     }
 
-    closeCurrentFile();
     currentLogFile = SD.open(path, FILE_WRITE);
     return (bool)currentLogFile;
 }
@@ -389,24 +562,38 @@ static void writeLogLine() {
 
     String loraStr = flushLoraBufferToString();
 
+    char headingStr[16];
+    if (lastHeadingDeg >= 0) snprintf(headingStr, sizeof(headingStr), "%.1f", lastHeadingDeg);
+    else strcpy(headingStr, "NA");
+
+    char stepsStr[16];
+    if (haveStepCount) snprintf(stepsStr, sizeof(stepsStr), "%lu", (unsigned long)lastStepCount);
+    else strcpy(stepsStr, "NA");
+
     bool fixOk = instance.gps.location.isValid() &&
                  instance.gps.satellites.isValid() &&
                  instance.gps.satellites.value() >= MIN_SATS_FOR_FIX;
 
     if (fixOk) {
-        currentLogFile.printf("%s_%.6f_%.6f_ok_%s_%s_%s\n",
+        currentLogFile.printf("%s_%.6f_%.6f_ok_%s_%s_%s_%s_%s_%s\n",
                               timeStr,
                               instance.gps.location.lat(),
                               instance.gps.location.lng(),
                               speedStr,
                               lastWifiSSIDs.c_str(),
-                              loraStr.c_str());
+                              loraStr.c_str(),
+                              lastBleList.c_str(),
+                              headingStr,
+                              stepsStr);
     } else {
-        currentLogFile.printf("%s_0.000000_0.000000_bad_gps_%s_%s_%s\n",
+        currentLogFile.printf("%s_0.000000_0.000000_bad_gps_%s_%s_%s_%s_%s_%s\n",
                               timeStr,
                               speedStr,
                               lastWifiSSIDs.c_str(),
-                              loraStr.c_str());
+                              loraStr.c_str(),
+                              lastBleList.c_str(),
+                              headingStr,
+                              stepsStr);
     }
     currentLogFile.flush();
     sessionLinesWritten++;
@@ -454,6 +641,118 @@ static void handleWifiScan() {
 }
 
 // ---------------------------------------------------------------------------
+// BLE passive scanning (listen-only, same philosophy as WiFi/Meshtastic - no
+// pairing, no connecting, just reading advertisement packets already being
+// broadcast). BLEScan::start() blocks for its duration (a few seconds), so
+// this runs periodically rather than continuously, same pattern as WiFi scan.
+//
+// Note: many phones/wearables use RANDOM, ROTATING BLE addresses for privacy
+// (a new address every ~15 min), so they won't build up repeat sightings
+// under one key - which is actually convenient, since it means that noise
+// self-filters out of the "stable points" database over time. Fixed smart-
+// home devices, beacons, and other infrastructure-style BLE gear typically
+// keep a stable address and are exactly what ends up useful here.
+// ---------------------------------------------------------------------------
+static void setupBleScanner() {
+    BLEDevice::init("");
+    bleScanner = BLEDevice::getScan();
+    bleScanner->setActiveScan(false); // passive only - never requests scan responses
+    bleScanner->setInterval(100);
+    bleScanner->setWindow(90);
+}
+
+static void handleBleScan() {
+    if (!bleScanner) return;
+    unsigned long now = millis();
+    if (now - lastBleScanMs < BLE_SCAN_INTERVAL_MS) return;
+    lastBleScanMs = now;
+
+    // Small local dedup buffer across chunks - a device seen in more than one
+    // chunk should only be counted/listed once, keeping its strongest RSSI.
+    #define BLE_MERGE_MAX 32
+    static String macs[BLE_MERGE_MAX];
+    static int rssis[BLE_MERGE_MAX];
+    int mergedCount = 0;
+
+    for (int chunk = 0; chunk < BLE_SCAN_CHUNKS; chunk++) {
+        BLEScanResults *results = bleScanner->start(BLE_SCAN_CHUNK_SEC, false);
+        int n = results->getCount();
+        for (int i = 0; i < n; i++) {
+            BLEAdvertisedDevice d = results->getDevice(i);
+            String mac = String(d.getAddress().toString().c_str());
+            mac.toUpperCase();
+            int rssi = d.getRSSI();
+
+            int existing = -1;
+            for (int j = 0; j < mergedCount; j++) {
+                if (macs[j] == mac) { existing = j; break; }
+            }
+            if (existing >= 0) {
+                if (rssi > rssis[existing]) rssis[existing] = rssi;
+            } else if (mergedCount < BLE_MERGE_MAX) {
+                macs[mergedCount] = mac;
+                rssis[mergedCount] = rssi;
+                mergedCount++;
+            }
+        }
+        bleScanner->clearResults();
+
+        // Give key presses a chance to register between chunks, instead of
+        // being stuck behind the whole scan budget in one uninterrupted block.
+        if (chunk < BLE_SCAN_CHUNKS - 1) handleKeyboard();
+    }
+
+    lastBleCount = mergedCount;
+    sessionBleScansTotal += mergedCount;
+
+    String entries = "";
+    for (int i = 0; i < mergedCount; i++) {
+        if (i > 0) entries += ",";
+        entries += macs[i];
+        entries += "|";
+        entries += String(rssis[i]);
+    }
+    lastBleList = entries;
+}
+
+// ---------------------------------------------------------------------------
+// IMU (BHI260AP hardware sensor hub) - heading + step count
+// ---------------------------------------------------------------------------
+static void setupImu() {
+    if (!(instance.getDeviceProbe() & HW_BHI260AP_ONLINE)) {
+        Serial.println("BHI260AP sensor not detected - IMU heading/steps disabled.");
+        return;
+    }
+    bhiQuaternion = new SensorQuaternion(instance.sensor);
+    bhiStepCounter = new SensorStepCounter(instance.sensor);
+
+    float sampleRate = 10.0;           // Hz - plenty for heading/step tracking, keeps power use low
+    uint32_t reportLatencyMs = 0;
+    bhiQuaternion->enable(sampleRate, reportLatencyMs);
+    bhiStepCounter->enable(1.0, reportLatencyMs); // step counter only reports on change anyway
+
+    imuReady = true;
+    Serial.println("BHI260AP sensor online - IMU heading/steps enabled.");
+}
+
+static void handleImu() {
+    if (!imuReady) return;
+    // instance.loop() services the sensor hub's IRQ (calls sensor.update()
+    // internally) - safe to call every iteration, it only touches the RTC/
+    // sensor hub, nothing we're already handling elsewhere ourselves.
+    instance.loop();
+
+    if (bhiQuaternion->hasUpdated()) {
+        bhiQuaternion->toEuler();
+        lastHeadingDeg = bhiQuaternion->getHeading();
+    }
+    if (bhiStepCounter->hasUpdated()) {
+        lastStepCount = bhiStepCounter->getStepCount();
+        haveStepCount = true;
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Meshtastic passive listening (no join, no transmit - just receive + parse header)
 // ---------------------------------------------------------------------------
 IRAM_ATTR void onLoraPacket() {
@@ -497,7 +796,6 @@ static void bufferLoraSighting(const String &id, int rssi) {
     lastMeshtasticRssi = rssi;
     lastMeshtasticMs = millis();
     bootLoraSightingsTotal++;
-    beepMeshtasticFound();
 
     for (int i = 0; i < loraBufferCount; i++) {
         if (loraBufferIds[i] == id) {
@@ -657,11 +955,53 @@ static void buildTrackScreen() {
     lv_obj_set_style_bg_color(trackScreen, lv_color_black(), 0);
     lv_obj_set_style_bg_opa(trackScreen, LV_OPA_COVER, 0);
 
+    trackBatteryLabel = createBatteryLabel(trackScreen);
+
+    // Recording indicator: filled circle (red while recording, dim grey while
+    // idle) + how many lines have been written this session.
+    recDot = lv_obj_create(trackScreen);
+    lv_obj_set_size(recDot, 14, 14);
+    lv_obj_set_style_radius(recDot, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_border_width(recDot, 0, 0);
+    lv_obj_set_style_bg_color(recDot, lv_color_make(70, 70, 70), 0);
+    lv_obj_clear_flag(recDot, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_align(recDot, LV_ALIGN_TOP_LEFT, 6, STATUS_BAR_H + 6);
+
+    recCountLabel = lv_label_create(trackScreen);
+    lv_obj_set_style_text_color(recCountLabel, lv_color_white(), 0);
+    lv_obj_align(recCountLabel, LV_ALIGN_TOP_LEFT, 26, STATUS_BAR_H + 4);
+    lv_label_set_text(recCountLabel, "0");
+
+    // Three colored count chips (WiFi/BLE/Meshtastic), same colors as the
+    // server's map, so the association is visual rather than needing a label.
+    struct { lv_obj_t **chip; lv_obj_t **label; lv_color_t color; int x; } chips[3] = {
+        { &wifiChip, &wifiChipLabel, COLOR_WIFI_CHIP, 110 },
+        { &bleChip,  &bleChipLabel,  COLOR_BLE_CHIP,  230 },
+        { &loraChip, &loraChipLabel, COLOR_LORA_CHIP, 350 },
+    };
+    for (int i = 0; i < 3; i++) {
+        lv_obj_t *chip = lv_obj_create(trackScreen);
+        lv_obj_set_size(chip, 110, 24);
+        lv_obj_set_style_bg_color(chip, chips[i].color, 0);
+        lv_obj_set_style_bg_opa(chip, LV_OPA_COVER, 0);
+        lv_obj_set_style_border_width(chip, 0, 0);
+        lv_obj_set_style_radius(chip, 6, 0);
+        lv_obj_clear_flag(chip, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_align(chip, LV_ALIGN_TOP_LEFT, chips[i].x, STATUS_BAR_H + 2);
+        *chips[i].chip = chip;
+
+        lv_obj_t *label = lv_label_create(chip);
+        lv_obj_set_style_text_color(label, lv_color_black(), 0);
+        lv_obj_center(label);
+        lv_label_set_text(label, "-");
+        *chips[i].label = label;
+    }
+
     trackStatusLabel = lv_label_create(trackScreen);
     lv_obj_set_style_text_color(trackStatusLabel, lv_color_white(), 0);
-    lv_obj_align(trackStatusLabel, LV_ALIGN_TOP_LEFT, 4, 2);
-
-    trackBatteryLabel = createBatteryLabel(trackScreen);
+    lv_obj_set_width(trackStatusLabel, SCR_W - 20);
+    lv_label_set_long_mode(trackStatusLabel, LV_LABEL_LONG_WRAP);
+    lv_obj_align(trackStatusLabel, LV_ALIGN_TOP_LEFT, 4, STATUS_BAR_H + 34);
 
     size_t bufSize = (size_t)SCR_W * TRACK_H * 2;
     canvasBuf = ps_malloc(bufSize);
@@ -669,60 +1009,6 @@ static void buildTrackScreen() {
     lv_canvas_set_buffer(canvas, canvasBuf, SCR_W, TRACK_H, LV_COLOR_FORMAT_RGB565);
     lv_obj_align(canvas, LV_ALIGN_TOP_LEFT, 0, HEADER_H);
     lv_canvas_fill_bg(canvas, lv_color_black(), LV_OPA_COVER);
-}
-
-static void buildDiagScreen() {
-    diagScreen = lv_obj_create(NULL);
-    lv_obj_set_style_bg_color(diagScreen, lv_color_black(), 0);
-    lv_obj_set_style_bg_opa(diagScreen, LV_OPA_COVER, 0);
-    lv_obj_set_scroll_dir(diagScreen, LV_DIR_VER);
-
-    diagBatteryLabel = createBatteryLabel(diagScreen);
-    lv_obj_add_flag(diagBatteryLabel, LV_OBJ_FLAG_FLOATING); // stays put while content scrolls
-
-    diagLabel = lv_label_create(diagScreen);
-    lv_obj_set_style_text_color(diagLabel, lv_color_make(120, 255, 120), 0);
-    lv_obj_set_style_text_font(diagLabel, &lv_font_montserrat_14, 0);
-    lv_obj_set_width(diagLabel, SCR_W - 16);
-    lv_label_set_long_mode(diagLabel, LV_LABEL_LONG_WRAP);
-    lv_obj_align(diagLabel, LV_ALIGN_TOP_LEFT, 6, 26);
-}
-
-static void buildGridScreen() {
-    gridScreen = lv_obj_create(NULL);
-    lv_obj_set_style_bg_color(gridScreen, lv_color_black(), 0);
-    lv_obj_set_style_bg_opa(gridScreen, LV_OPA_COVER, 0);
-    lv_obj_clear_flag(gridScreen, LV_OBJ_FLAG_SCROLLABLE);
-
-    gridBatteryLabel = createBatteryLabel(gridScreen);
-
-    int cellW = SCR_W / 2 - 6;
-    int cellH = SCR_H / 2 - 6;
-    gridCellGps  = lv_obj_create(gridScreen);
-    gridCellWifi = lv_obj_create(gridScreen);
-    gridCellLora = lv_obj_create(gridScreen);
-    gridCellSd   = lv_obj_create(gridScreen);
-
-    lv_obj_t *cells[4]      = { gridCellGps, gridCellWifi, gridCellLora, gridCellSd };
-    lv_obj_t **labels[4]    = { &gridLabelGps, &gridLabelWifi, &gridLabelLora, &gridLabelSd };
-    lv_align_t aligns[4]    = { LV_ALIGN_TOP_LEFT, LV_ALIGN_TOP_RIGHT, LV_ALIGN_BOTTOM_LEFT, LV_ALIGN_BOTTOM_RIGHT };
-    int xoff[4] = { 4, -4, 4, -4 };
-    int yoff[4] = { 4, 4, -4, -4 };
-
-    for (int i = 0; i < 4; i++) {
-        lv_obj_set_size(cells[i], cellW, cellH);
-        lv_obj_align(cells[i], aligns[i], xoff[i], yoff[i]);
-        lv_obj_set_style_bg_color(cells[i], lv_color_make(60, 60, 60), 0);
-        lv_obj_set_style_bg_opa(cells[i], LV_OPA_COVER, 0);
-        lv_obj_set_style_border_width(cells[i], 0, 0);
-        lv_obj_set_style_radius(cells[i], 6, 0);
-        lv_obj_clear_flag(cells[i], LV_OBJ_FLAG_SCROLLABLE);
-
-        lv_obj_t *label = lv_label_create(cells[i]);
-        lv_obj_set_style_text_color(label, lv_color_white(), 0);
-        lv_obj_align(label, LV_ALIGN_TOP_LEFT, 4, 2);
-        *labels[i] = label;
-    }
 }
 
 static void buildStoppedScreen() {
@@ -735,6 +1021,28 @@ static void buildStoppedScreen() {
     lv_obj_set_style_text_font(label, &lv_font_montserrat_20, 0);
     lv_label_set_text(label, "Application stopped.\nReboot the device to start again.");
     lv_obj_center(label);
+}
+
+static void buildSyncScreen() {
+    syncScreen = lv_obj_create(NULL);
+    lv_obj_set_style_bg_color(syncScreen, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(syncScreen, LV_OPA_COVER, 0);
+
+    syncLabel = lv_label_create(syncScreen);
+    lv_obj_set_style_text_color(syncLabel, lv_color_white(), 0);
+    lv_obj_set_width(syncLabel, SCR_W - 24);
+    lv_label_set_long_mode(syncLabel, LV_LABEL_LONG_WRAP);
+    lv_obj_align(syncLabel, LV_ALIGN_TOP_LEFT, 12, 12);
+    lv_label_set_text(syncLabel, "Sync");
+}
+
+// Updates the sync status text AND actually repaints the screen right now -
+// this whole feature runs as one long blocking sequence (WiFi connect + HTTP
+// calls can take several seconds each), so without forcing a redraw here the
+// person would just stare at a frozen screen until the entire sync finishes.
+static void syncStatus(const String &text) {
+    lv_label_set_text(syncLabel, text.c_str());
+    lv_timer_handler();
 }
 
 // ---------------------------------------------------------------------------
@@ -750,156 +1058,34 @@ static void updateTrackScreen() {
 
     if (instance.gps.location.isValid()) {
         lv_label_set_text_fmt(trackStatusLabel,
-            "%s   Sat:%d   Lat:%.6f Lon:%.6f\n"
-            "Track length: %.2f km   Speed:%s   Lines:%lu",
-            recording ? "RECORDING" : "IDLE",
+            "Sat:%d   Lat:%.6f Lon:%.6f\n"
+            "Track: %.2f km   Speed:%s",
             instance.gps.satellites.isValid() ? instance.gps.satellites.value() : 0,
             instance.gps.location.lat(), instance.gps.location.lng(),
-            lengthKm, speedStr, sessionLinesWritten);
+            lengthKm, speedStr);
     } else {
         lv_label_set_text_fmt(trackStatusLabel,
-            "%s   Sat:%d   Lat:--.------ Lon:--.------ (waiting for fix)\n"
-            "Track length: %.2f km   Speed:%s   Lines:%lu",
-            recording ? "RECORDING" : "IDLE",
+            "Sat:%d   Lat:--.------ Lon:--.------ (waiting for fix)\n"
+            "Track: %.2f km   Speed:%s",
             instance.gps.satellites.isValid() ? instance.gps.satellites.value() : 0,
-            lengthKm, speedStr, sessionLinesWritten);
+            lengthKm, speedStr);
     }
+
+    // Recording indicator + line count
+    lv_obj_set_style_bg_color(recDot, recording ? lv_color_make(220, 30, 30) : lv_color_make(70, 70, 70), 0);
+    lv_label_set_text_fmt(recCountLabel, "%lu", sessionLinesWritten);
+
+    // Colored network chips - counts only, no "last heard" timing anywhere
+    lv_label_set_text_fmt(wifiChipLabel, "W %d", lastWifiCount);
+    lv_label_set_text_fmt(bleChipLabel, "B %d", lastBleCount);
+    lv_label_set_text_fmt(loraChipLabel, "M %lu", bootLoraSightingsTotal);
+
     updateBatteryLabel(trackBatteryLabel);
-}
-
-static String formatWifiListForDiag(int maxEntries) {
-    if (lastWifiSSIDs.length() == 0) return "  (none)";
-    String out = "";
-    int start = 0, shown = 0;
-    while (start < (int)lastWifiSSIDs.length() && shown < maxEntries) {
-        int comma = lastWifiSSIDs.indexOf(',', start);
-        String entry = (comma == -1) ? lastWifiSSIDs.substring(start) : lastWifiSSIDs.substring(start, comma);
-        int p1 = entry.indexOf('|');
-        int p2 = (p1 == -1) ? -1 : entry.indexOf('|', p1 + 1);
-        if (p1 != -1 && p2 != -1) {
-            String ssid = entry.substring(0, p1);
-            if (ssid.length() == 0) ssid = "(hidden)";
-            String rssi = entry.substring(p2 + 1);
-            out += "  " + ssid + " (" + rssi + " dBm)\n";
-            shown++;
-        }
-        if (comma == -1) break;
-        start = comma + 1;
-    }
-    return (shown == 0) ? "  (none)" : out;
-}
-
-static void updateDiagScreen() {
-    bool fixOk = instance.gps.location.isValid() &&
-                 instance.gps.satellites.isValid() &&
-                 instance.gps.satellites.value() >= MIN_SATS_FOR_FIX;
-
-    char gpsLine[80];
-    if (instance.gps.location.isValid()) {
-        snprintf(gpsLine, sizeof(gpsLine), "Lat:%.6f Lon:%.6f Alt:%.0fm Spd:%.1fkm/h HDOP:%.1f",
-                 instance.gps.location.lat(), instance.gps.location.lng(),
-                 instance.gps.altitude.isValid() ? instance.gps.altitude.meters() : 0.0,
-                 instance.gps.speed.isValid() ? instance.gps.speed.kmph() : 0.0,
-                 instance.gps.hdop.isValid() ? instance.gps.hdop.hdop() : 0.0);
-    } else {
-        snprintf(gpsLine, sizeof(gpsLine), "Lat:--.------ Lon:--.------ (no fix yet)");
-    }
-
-    unsigned long meshAgoSec = (lastMeshtasticMs > 0) ? (millis() - lastMeshtasticMs) / 1000 : 0;
-    char meshLastLine[64];
-    if (lastMeshtasticMs > 0) {
-        snprintf(meshLastLine, sizeof(meshLastLine), "%s, rssi %d dBm, %lus ago",
-                 lastMeshtasticId.c_str(), lastMeshtasticRssi, meshAgoSec);
-    } else {
-        strcpy(meshLastLine, "(none heard yet)");
-    }
-
-    int battPct; bool battCharging;
-    getBatteryInfo(battPct, battCharging);
-
-    lv_label_set_text_fmt(diagLabel,
-        "SELF-DIAGNOSTICS   (S or ENTER to exit, scroll wheel to scroll)\n"
-        "\n"
-        "GPS: %s, sats:%d, chars:%lu, sentences:%lu, failed-cksum:%lu\n"
-        "%s\n"
-        "\n"
-        "WiFi: last scan %d networks\n"
-        "%s"
-        "\n"
-        "Meshtastic: channel %s (%.6f MHz), heard total:%lu\n"
-        "  last: %s\n"
-        "\n"
-        "SD: %s   Battery: %d%%%s\n"
-        "Free heap: %lu KB   Free PSRAM: %lu KB",
-        fixOk ? "FIX" : "searching",
-        instance.gps.satellites.isValid() ? instance.gps.satellites.value() : 0,
-        instance.gps.charsProcessed(), instance.gps.sentencesWithFix(), instance.gps.failedChecksum(),
-        gpsLine,
-        lastWifiCount,
-        formatWifiListForDiag(4).c_str(),
-        MESHTASTIC_CHANNELS[currentMeshtasticChannelIdx].tag,
-        MESHTASTIC_CHANNELS[currentMeshtasticChannelIdx].freqMHz,
-        bootLoraSightingsTotal,
-        meshLastLine,
-        sdReady ? "ready" : "NOT FOUND",
-        battPct, battCharging ? " (charging)" : "",
-        (unsigned long)(ESP.getFreeHeap() / 1024),
-        (unsigned long)(ESP.getFreePsram() / 1024));
-
-    updateBatteryLabel(diagBatteryLabel);
-}
-
-static void setCellColor(lv_obj_t *cell, bool ok) {
-    lv_obj_set_style_bg_color(cell, ok ? lv_color_make(30, 110, 30) : lv_color_make(140, 30, 30), 0);
-}
-
-static void updateGridScreen() {
-    bool gpsOk = instance.gps.location.isValid() &&
-                 instance.gps.satellites.isValid() &&
-                 instance.gps.satellites.value() >= MIN_SATS_FOR_FIX;
-    setCellColor(gridCellGps, gpsOk);
-    lv_label_set_text_fmt(gridLabelGps, "GPS\n%s\nSat:%d",
-        gpsOk ? "FIX" : "NO FIX",
-        instance.gps.satellites.isValid() ? instance.gps.satellites.value() : 0);
-
-    bool wifiOk = lastWifiCount > 0;
-    setCellColor(gridCellWifi, wifiOk);
-    lv_label_set_text_fmt(gridLabelWifi, "WiFi\n%s\n%d networks",
-        wifiOk ? "OK" : "NONE SEEN", lastWifiCount);
-
-    bool loraOk = (lastMeshtasticMs > 0) && (millis() - lastMeshtasticMs < MESHTASTIC_STALE_MS);
-    setCellColor(gridCellLora, loraOk);
-    if (lastMeshtasticMs > 0) {
-        lv_label_set_text_fmt(gridLabelLora, "Meshtastic\n%s\n%lus ago",
-            loraOk ? "OK" : "STALE", (millis() - lastMeshtasticMs) / 1000);
-    } else {
-        lv_label_set_text(gridLabelLora, "Meshtastic\nNONE HEARD\n-");
-    }
-
-    setCellColor(gridCellSd, sdReady);
-    lv_label_set_text_fmt(gridLabelSd, "SD Card\n%s\n%s",
-        sdReady ? "READY" : "NOT FOUND",
-        recording ? "recording" : "idle");
-
-    updateBatteryLabel(gridBatteryLabel);
 }
 
 // ---------------------------------------------------------------------------
 // State transitions
 // ---------------------------------------------------------------------------
-static void loadCurrentModeScreen() {
-    switch (displayMode) {
-        case MODE_TRACK: lv_scr_load(trackScreen); break;
-        case MODE_DIAG:  lv_scr_load(diagScreen);  break;
-        case MODE_GRID:  lv_scr_load(gridScreen);  break;
-    }
-}
-
-static void cycleDisplayMode() {
-    displayMode = (DisplayMode)((displayMode + 1) % 3);
-    loadCurrentModeScreen();
-}
-
 static void startRecording() {
     if (!sdReady) return;
     sessionLinesWritten = 0;
@@ -930,26 +1116,292 @@ static void exitApplication() {
 // ---------------------------------------------------------------------------
 // Keyboard + rotary encoder handling
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// WiFi sync: upload only the log files the server doesn't have yet
+// ---------------------------------------------------------------------------
+// Loads ssid/password/server_url from SYNC_CONFIG_PATH on the SD card.
+// Simple "key=value" text format, one per line - edited on a computer before
+// inserting the card, so there's no need for an on-device password entry UI.
+static bool loadSyncConfig() {
+    if (!sdReady) return false;
+    File f = SD.open(SYNC_CONFIG_PATH);
+    if (!f) return false;
+
+    syncSsid = ""; syncPassword = ""; syncServerUrl = ""; syncApiPassword = "";
+    while (f.available()) {
+        String line = f.readStringUntil('\n');
+        line.trim();
+        int eq = line.indexOf('=');
+        if (eq < 0) continue;
+        String key = line.substring(0, eq);
+        String val = line.substring(eq + 1);
+        key.trim(); val.trim();
+        if (key == "ssid") syncSsid = val;
+        else if (key == "password") syncPassword = val;
+        else if (key == "server_url") syncServerUrl = val;
+        else if (key == "sync_password") syncApiPassword = val;
+    }
+    f.close();
+
+    // strip a trailing slash so "url + /api/..." never ends up with "//"
+    while (syncServerUrl.endsWith("/")) syncServerUrl.remove(syncServerUrl.length() - 1);
+
+    syncConfigLoaded = (syncSsid.length() > 0 && syncServerUrl.length() > 0);
+    return syncConfigLoaded;
+}
+
+// Lists every .txt file directly inside SD_ROOT (non-recursive - that's
+// where the firmware always writes its log files).
+static int listSdTxtFiles(String *outNames, int maxCount) {
+    int count = 0;
+    File dir = SD.open(SD_ROOT);
+    if (!dir) return 0;
+    File entry = dir.openNextFile();
+    while (entry && count < maxCount) {
+        if (!entry.isDirectory()) {
+            String name = String(entry.name());
+            int slash = name.lastIndexOf('/');
+            if (slash >= 0) name = name.substring(slash + 1); // some cores return the full path
+            if (name.endsWith(".txt")) {
+                outNames[count++] = name;
+            }
+        }
+        entry.close();
+        entry = dir.openNextFile();
+    }
+    dir.close();
+    return count;
+}
+
+// Asks the server which of these filenames it doesn't have yet. Minimal
+// hand-rolled JSON (no library) - safe here because our filenames always
+// match log_YYYYMMDD_HHMMSS.txt, never containing quotes/backslashes/commas.
+// Returns how many names were written into outMissing (capped at maxOut).
+static int httpSyncCheck(String *names, int nameCount, String *outMissing, int maxOut) {
+    String body = "{\"filenames\":[";
+    for (int i = 0; i < nameCount; i++) {
+        if (i > 0) body += ",";
+        body += "\"" + names[i] + "\"";
+    }
+    body += "]}";
+
+    HTTPClient http;
+    http.setTimeout(HTTP_TIMEOUT_MS);
+    http.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
+    http.begin(syncServerUrl + "/api/sync/check");
+    http.addHeader("Content-Type", "application/json");
+    http.addHeader("X-Sync-Password", syncApiPassword);
+    int code = http.POST(body);
+    lastHttpErrorCode = code;
+    Serial.printf("Sync check -> HTTP code %d\n", code);
+    if (code == 401) {
+        http.end();
+        return -401;
+    }
+    if (code != 200) {
+        http.end();
+        return -1;
+    }
+    String resp = http.getString();
+    http.end();
+
+    int arrStart = resp.indexOf('[');
+    int arrEnd = resp.indexOf(']', arrStart);
+    if (arrStart < 0 || arrEnd < 0) return 0;
+    String arr = resp.substring(arrStart + 1, arrEnd);
+
+    int outCount = 0;
+    int pos = 0;
+    while (pos < (int)arr.length() && outCount < maxOut) {
+        int q1 = arr.indexOf('"', pos);
+        if (q1 < 0) break;
+        int q2 = arr.indexOf('"', q1 + 1);
+        if (q2 < 0) break;
+        outMissing[outCount++] = arr.substring(q1 + 1, q2);
+        pos = q2 + 1;
+    }
+    return outCount;
+}
+
+// Uploads one file as multipart/form-data to /api/upload (field name
+// "logfiles", matching the server's normal web-upload form). Files are read
+// fully into memory - fine given each one only spans a single 30-minute
+// recording chunk. Returns the HTTP status code, or -1 on a local failure.
+static int uploadFileToServer(const String &filename) {
+    char path[96];
+    snprintf(path, sizeof(path), "%s/%s", SD_ROOT, filename.c_str());
+    File f = SD.open(path);
+    if (!f) return -1;
+
+    String contents;
+    contents.reserve(f.size() + 16);
+    uint8_t buf[512];
+    while (f.available()) {
+        size_t n = f.read(buf, sizeof(buf));
+        for (size_t i = 0; i < n; i++) contents += (char)buf[i];
+    }
+    f.close();
+
+    String boundary = "----wifigpsTrackerBoundary7MA4YWxk";
+    String bodyStart = "--" + boundary + "\r\n"
+        + "Content-Disposition: form-data; name=\"logfiles\"; filename=\"" + filename + "\"\r\n"
+        + "Content-Type: text/plain\r\n\r\n";
+    String bodyEnd = "\r\n--" + boundary + "--\r\n";
+    String fullBody = bodyStart + contents + bodyEnd;
+
+    HTTPClient http;
+    http.setTimeout(HTTP_TIMEOUT_MS);
+    http.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
+    http.begin(syncServerUrl + "/api/upload");
+    http.addHeader("Content-Type", "multipart/form-data; boundary=" + boundary);
+    http.addHeader("X-Sync-Password", syncApiPassword);
+    int code = http.POST((uint8_t *)fullBody.c_str(), fullBody.length());
+    Serial.printf("Upload %s -> HTTP code %d\n", filename.c_str(), code);
+    http.end();
+    lastHttpErrorCode = code;
+    return code;
+}
+
+
+
+// The whole sync flow: connect to WiFi, ask the server what's missing,
+// upload just those files, then disconnect and resume normal operation.
+// Fully blocking by design - it's a deliberate, occasional user action (only
+// reachable from the idle screen, recording must be off), not something that
+// needs to run alongside GPS/WiFi-scan/Meshtastic in the background.
+static void runWifiSync() {
+    inSyncScreen = true;
+    lv_scr_load(syncScreen);
+
+    if (!loadSyncConfig()) {
+        syncStatus("Sync failed:\nno " SYNC_CONFIG_PATH " found on the SD card,\nor it's missing ssid/server_url.\n\nPress ENTER to go back.");
+        return;
+    }
+
+    syncStatus("Connecting to WiFi:\n" + syncSsid + " ...");
+    WiFi.disconnect();
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(syncSsid.c_str(), syncPassword.c_str());
+
+    unsigned long start = millis();
+    while (WiFi.status() != WL_CONNECTED && millis() - start < WIFI_CONNECT_TIMEOUT_MS) {
+        delay(200);
+    }
+    if (WiFi.status() != WL_CONNECTED) {
+        syncStatus("Sync failed:\ncould not connect to " + syncSsid + "\nwithin " + String(WIFI_CONNECT_TIMEOUT_MS / 1000) + "s.\n\nPress ENTER to go back.");
+        WiFi.disconnect();
+        return;
+    }
+
+    syncStatus("Connected.\nListing files on SD card...");
+    static String allFiles[MAX_SD_FILES_TRACKED];
+    int fileCount = listSdTxtFiles(allFiles, MAX_SD_FILES_TRACKED);
+    if (fileCount == 0) {
+        syncStatus("No log files found in " SD_ROOT ".\n\nPress ENTER to go back.");
+        WiFi.disconnect();
+        return;
+    }
+
+    syncStatus("Checking with server which of " + String(fileCount) + " files are missing...");
+    static String missing[MAX_SD_FILES_TRACKED];
+    int missingCount = httpSyncCheck(allFiles, fileCount, missing, MAX_SD_FILES_TRACKED);
+    if (missingCount == -401) {
+        syncStatus("Sync failed:\nwrong sync_password\n(check sync_password in " SYNC_CONFIG_PATH ").\n\nPress ENTER to go back.");
+        WiFi.disconnect();
+        return;
+    }
+    if (missingCount < 0) {
+        syncStatus("Sync failed:\ncould not reach " + syncServerUrl + "\ncode=" + String(lastHttpErrorCode) + "\n(check server_url in " SYNC_CONFIG_PATH ").\n\nPress ENTER to go back.");
+        WiFi.disconnect();
+        return;
+    }
+    if (missingCount == 0) {
+        syncStatus("Nothing to upload -\nserver already has all " + String(fileCount) + " files.\n\nPress ENTER to go back.");
+        WiFi.disconnect();
+        return;
+    }
+
+    int uploaded = 0, failed = 0, cleaned = 0;
+    for (int i = 0; i < missingCount; i++) {
+        syncStatus("Uploading " + String(i + 1) + "/" + String(missingCount) + ":\n" + missing[i]);
+        int code = uploadFileToServer(missing[i]);
+        if (code == 200) {
+            uploaded++;
+            // Confirmed safely on the server now - remove it from the SD card
+            // right away to free space (this is the main way space gets
+            // reclaimed; pruneOldLogsIfOverBudget() is only a fallback).
+            char path[96];
+            snprintf(path, sizeof(path), "%s/%s", SD_ROOT, missing[i].c_str());
+            if (SD.remove(path)) cleaned++;
+        } else {
+            failed++; // kept on SD - will be retried on the next sync
+        }
+    }
+
+    WiFi.disconnect();
+    syncStatus("Sync done: " + String(uploaded) + " uploaded & " + String(cleaned) + " removed from SD, "
+               + String(failed) + " failed (kept for retry).\n\nPress ENTER to go back.");
+}
+
+// ---------------------------------------------------------------------------
+// Screen sleep (battery saving) - only while running on battery, not while
+// charging. GPS/recording/WiFi/BLE/Meshtastic scanning all keep running
+// regardless of screen state; only the backlight (and, to save a little more
+// power/CPU, the display redraw work) is skipped while asleep.
+// ---------------------------------------------------------------------------
+static void wakeScreen() {
+    if (!screenAsleep) return;
+    screenAsleep = false;
+    instance.setBrightness(DEVICE_MAX_BRIGHTNESS_LEVEL);
+    lastKeyActivityMs = millis();
+}
+
+static void sleepScreen() {
+    if (screenAsleep) return;
+    screenAsleep = true;
+    instance.setBrightness(0);
+}
+
+static unsigned long lastSleepCheckMs = 0;
+static void handleScreenSleep() {
+    unsigned long now = millis();
+    if (now - lastSleepCheckMs < 1000) return;
+    lastSleepCheckMs = now;
+    if (screenAsleep) return;
+    if (!instance.ppm.isCharging() && (now - lastKeyActivityMs >= SCREEN_SLEEP_TIMEOUT_MS)) {
+        sleepScreen();
+    }
+}
+
 static void handleKeyboard() {
     char c;
     int st = instance.kb.getKey(&c);
     if (st == KB_PRESSED) {
+        if (screenAsleep) {
+            // Only SPACE wakes the screen - every other key is ignored while
+            // asleep, so a stray press (e.g. in a pocket) doesn't trigger
+            // recording/exit/etc unexpectedly.
+            if (c == ' ') wakeScreen();
+            return;
+        }
+        lastKeyActivityMs = millis();
+
+        if (inSyncScreen) {
+            // Any key dismisses the sync result screen and goes back to normal.
+            inSyncScreen = false;
+            WiFi.mode(WIFI_STA);
+            WiFi.disconnect();
+            lv_scr_load(trackScreen);
+            return;
+        }
         if (c == 0x0A || c == '\r' || c == '\n') {
             if (recording) stopRecording();
             else startRecording();
         } else if (c == 'e' || c == 'E') {
             exitApplication();
-        } else if (c == 's' || c == 'S') {
-            cycleDisplayMode();
+        } else if (c == 'u' || c == 'U') {
+            if (!recording) runWifiSync();
         }
-    }
-
-    RotaryMsg_t rot = instance.getRotary();
-    if (rot.dir != ROTARY_DIR_NONE) {
-        if (displayMode == MODE_DIAG) {
-            lv_obj_scroll_by(diagScreen, 0, (rot.dir == ROTARY_DIR_DOWN) ? -30 : 30, LV_ANIM_ON);
-        }
-        instance.clearRotaryMsg();
     }
 }
 
@@ -964,6 +1416,7 @@ static void handleRecording() {
                  instance.gps.satellites.isValid() &&
                  instance.gps.satellites.value() >= MIN_SATS_FOR_FIX;
     if (fixOk && !wasFix) beepGpsFixAcquired();
+    if (!fixOk && wasFix) beepGpsFixLost();
     hadGpsFix = fixOk;
 
     if (fixOk && instance.gps.location.isUpdated()) {
@@ -993,6 +1446,7 @@ static void handleGpsFixWatcher() {
                  instance.gps.satellites.isValid() &&
                  instance.gps.satellites.value() >= MIN_SATS_FOR_FIX;
     if (fixOk && !hadGpsFix) beepGpsFixAcquired();
+    if (!fixOk && hadGpsFix) beepGpsFixLost();
     hadGpsFix = fixOk;
 }
 
@@ -1012,19 +1466,19 @@ static void handleLowBatteryBeep() {
 // ---------------------------------------------------------------------------
 void setup() {
     Serial.begin(115200);
+    bootMs = millis();
 
     instance.begin();
     beginLvglHelper(instance);
     instance.setBrightness(DEVICE_MAX_BRIGHTNESS_LEVEL);
-    instance.enableRotary();
 
     buildTrackScreen();
-    buildDiagScreen();
-    buildGridScreen();
     buildStoppedScreen();
-    displayMode = MODE_TRACK;
+    buildSyncScreen();
     lv_scr_load(trackScreen);
     lv_timer_handler();
+
+    lastKeyActivityMs = millis();
 
     initAudio();
 
@@ -1044,6 +1498,9 @@ void setup() {
         Serial.println("Meshtastic listener init failed - continuing without it.");
     }
 
+    setupBleScanner();
+    setupImu();
+
     lastLowBattBeepMs = millis();
 }
 
@@ -1055,9 +1512,17 @@ void loop() {
     }
 
     handleKeyboard();
+    handleScreenSleep();
     handleWifiScan();
+    handleBleScan();
     handleLoraRx();
+    handleImu();
     handleLowBatteryBeep();
+
+    if (!recording && !autoRecordTriggered && millis() - bootMs >= AUTO_RECORD_START_MS) {
+        autoRecordTriggered = true;
+        startRecording();
+    }
 
     if (recording) {
         handleRecording();
@@ -1067,12 +1532,8 @@ void loop() {
     }
 
     unsigned long now = millis();
-    if (now - lastDisplayUpdate >= DISPLAY_UPDATE_MS) {
-        switch (displayMode) {
-            case MODE_TRACK: updateTrackScreen(); break;
-            case MODE_DIAG:  updateDiagScreen();  break;
-            case MODE_GRID:  updateGridScreen();  break;
-        }
+    if (!inSyncScreen && !screenAsleep && now - lastDisplayUpdate >= DISPLAY_UPDATE_MS) {
+        updateTrackScreen();
         lastDisplayUpdate = now;
     }
 
