@@ -34,11 +34,38 @@ by hand every time:
 3. Progress and a final summary ("Sync done: N uploaded, M failed") are shown
    on screen; press any key to dismiss and return to normal operation
    (WiFi switches back to scan-only mode automatically).
+<<<<<<< HEAD
 
 This whole process is blocking (GPS/WiFi-scan/Meshtastic pause for its
 duration - typically a few seconds to connect plus roughly a second per file)
 since it's a deliberate, occasional action, not something meant to run in the
 background during a drive.
+=======
+
+This whole process is blocking (GPS/WiFi-scan/Meshtastic pause for its
+duration - typically a few seconds to connect plus roughly a second per file)
+since it's a deliberate, occasional action, not something meant to run in the
+background during a drive.
+
+**Display modes** - **S** cycles between three screens (recording, if active,
+keeps running in the background regardless of which screen is shown):
+
+1. **Track** - red track on a black background (bottom part of the screen) +
+   status line: recording/idle, satellite count, coordinates, **track length
+   in km**, speed, lines written, and a compact WiFi/BLE/Meshtastic
+   at-a-glance line
+2. **Diagnostics** - full-screen, scrollable text (use the **rotary
+   scroll wheel** on the side of the device to scroll up/down): raw GPS stats
+   (characters processed, sentences with a fix, failed checksums, lat/lon/alt/
+   speed/HDOP), last WiFi scan (up to 4 networks with RSSI), BLE scan count,
+   Meshtastic status (current channel, total heard since boot, last node
+   heard + RSSI + seconds ago), SD card status, free heap/PSRAM
+3. **Grid** - screen split into a 3x2 grid (6 cells): GPS / WiFi / BLE /
+   Meshtastic / SD / Recording, colored **green** when everything looks fine
+   and data is coming in, **red** when there's a problem (no fix, no networks
+   seen, no recent Meshtastic activity, SD not found) - Recording is neutral
+   (blue when active, grey when idle), not a pass/fail status
+>>>>>>> 81856dd9660b9bbd9720e339e2d7e01d0e5dbea0
 
 **Single-screen display** - red track on a black background, plus a header:
 - top-right: battery percentage (turns red at 15% or below)
@@ -78,7 +105,11 @@ header chip, no audio interruption.)
 - `/WIFIGPS` folder at the root of the SD card
 - a new file every 30 minutes of recording: `log_YYYYMMDD_HHMMSS.txt` (name uses local
   UTC+3 time at file-creation time)
+<<<<<<< HEAD
 - **circular buffer:** total log data on the SD card is capped at 10 MB. The main way
+=======
+- **circular buffer:** total log data on the SD card is capped at 5 MB. The main way
+>>>>>>> 81856dd9660b9bbd9720e339e2d7e01d0e5dbea0
   space gets freed is that each file is deleted right after a confirmed-successful
   WiFi sync upload (see below); as a fallback, if the cap would still be exceeded (sync
   hasn't run in a while), the oldest files are deleted automatically when a new one starts
@@ -131,11 +162,17 @@ likely that there's simply no local Meshtastic traffic on the given channel/freq
 at that moment and place - give it a few minutes in a spot with likely coverage.
 
 **About BLE scanning (passive, no pairing/connecting):** uses the classic Arduino BLE
+<<<<<<< HEAD
 library bundled with arduino-esp32. Because that API is blocking (and only accepts
 whole-second durations), a scan cycle is split into two 1-second chunks every 25
 seconds, with a keyboard check in between, rather than one longer uninterrupted
 block - this keeps key presses responsive even during a scan (see "why button
 presses used to feel laggy" below). Unlike the HTTPClient and
+=======
+library bundled with arduino-esp32. Because that API is blocking, scanning happens in
+short 2-second bursts every 25 seconds rather than continuously - a deliberate
+trade-off to limit how much it can interrupt GPS reading. Unlike the HTTPClient and
+>>>>>>> 81856dd9660b9bbd9720e339e2d7e01d0e5dbea0
 BHI260AP sensor code (verified against LilyGoLib's own official examples), the exact
 `BLEScan::start()` signature couldn't be verified against a real compile in the
 environment this was written in - if the build fails specifically in
@@ -143,6 +180,7 @@ environment this was written in - if the build fails specifically in
 mismatch for the installed arduino-esp32 core version (worth checking
 `BLEScan.h` in the installed core if so).
 
+<<<<<<< HEAD
 **Why button presses used to feel laggy:** the single biggest cause was BLE
 scanning blocking the main loop for a full 2 seconds at a time - any key
 press during that window was missed until the scan finished, sometimes
@@ -152,6 +190,8 @@ the old Diagnostics/Grid screens also helps a little, since there's no more
 `lv_scr_load()` switching or extra per-frame update work for screens you
 aren't looking at.
 
+=======
+>>>>>>> 81856dd9660b9bbd9720e339e2d7e01d0e5dbea0
 **About the IMU (BHI260AP sensor hub):** provides a hardware-fused compass heading and
 a hardware step counter - no custom sensor-fusion math needed. If your board doesn't
 have this sensor populated, the firmware detects that at boot and just logs `NA` for
